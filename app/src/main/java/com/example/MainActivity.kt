@@ -161,7 +161,7 @@ fun MainScreen(viewModel: MainViewModel) {
                             modifier = Modifier.size(28.dp)
                         )
                         Text(
-                            text = "Extrai Cartão",
+                            text = "CardZap",
                             fontWeight = FontWeight.Bold,
                             style = MaterialTheme.typography.titleMedium
                         )
@@ -328,6 +328,17 @@ fun ScanReviewLayout(
     val context = LocalContext.current
     val scrollState = rememberScrollState()
 
+    var sendToWhatsApp by remember { mutableStateOf(true) }
+    var useBusinessWhatsApp by remember { mutableStateOf(false) }
+    var customMessage by remember { mutableStateOf("") }
+
+    val defaultMsg = viewModel.getWhatsAppMessage()
+    LaunchedEffect(viewModel.parsedName, viewModel.userName) {
+        if (customMessage.isEmpty() || customMessage.contains("()  .") || customMessage.contains("o(a)  .")) {
+            customMessage = defaultMsg
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -478,6 +489,92 @@ fun ScanReviewLayout(
             supportingText = { Text("Compilado dinâmico das listagens ou especialidades do cartão.") }
         )
 
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Checkbox(
+                        checked = sendToWhatsApp,
+                        onCheckedChange = { sendToWhatsApp = it }
+                    )
+                    Text(
+                        text = "Enviar mensagem de apresentação ao salvar",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+
+                if (sendToWhatsApp) {
+                    Text(
+                        text = "Selecione o canal de envio (Remetente):",
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(start = 12.dp, top = 4.dp)
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(start = 12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.clickable { useBusinessWhatsApp = false }
+                        ) {
+                            RadioButton(
+                                selected = !useBusinessWhatsApp,
+                                onClick = { useBusinessWhatsApp = false }
+                            )
+                            Text("WhatsApp Padrão", fontSize = 13.sp)
+                        }
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.clickable { useBusinessWhatsApp = true }
+                        ) {
+                            RadioButton(
+                                selected = useBusinessWhatsApp,
+                                onClick = { useBusinessWhatsApp = true }
+                            )
+                            Text("WhatsApp Business", fontSize = 13.sp)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    Text(
+                        text = "Mensagem para Enviar (Personalize se desejar):",
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(start = 12.dp)
+                    )
+
+                    OutlinedTextField(
+                        value = customMessage,
+                        onValueChange = { customMessage = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        maxLines = 8,
+                        minLines = 3,
+                        textStyle = MaterialTheme.typography.bodyMedium,
+                        shape = RoundedCornerShape(8.dp),
+                        supportingText = { Text("Lembrete: A variável de usuário Google foi configurada como $ {usuario_android} (definida pelo campo usuario_android).", fontSize = 10.sp) }
+                    )
+                }
+            }
+        }
+
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -499,8 +596,21 @@ fun ScanReviewLayout(
                     if (viewModel.parsedName.isBlank()) {
                         Toast.makeText(context, "Por favor insira um nome antes de salvar", Toast.LENGTH_SHORT).show()
                     } else {
+                        val phone = viewModel.parsedPrimaryPhone
+                        val msgToSubmit = customMessage
+                        val shouldOpenWhatsApp = sendToWhatsApp
+                        val isBusiness = useBusinessWhatsApp
+
                         viewModel.saveContact()
                         Toast.makeText(context, "Contato salvo com sucesso!", Toast.LENGTH_SHORT).show()
+
+                        if (shouldOpenWhatsApp) {
+                            if (phone.isNotBlank()) {
+                                openWhatsAppChat(context, phone, msgToSubmit, isBusiness)
+                            } else {
+                                Toast.makeText(context, "Contato salvo, mas telefone principal está vazio para WhatsApp.", Toast.LENGTH_LONG).show()
+                            }
+                        }
                     }
                 },
                 modifier = Modifier
@@ -844,6 +954,34 @@ fun formatNumberToWhatsApp(phone: String): String {
         "55$digits" // Automatically prepending Brazil standard country code
     } else {
         digits
+    }
+}
+
+fun openWhatsAppChat(context: Context, phone: String, message: String, useBusiness: Boolean) {
+    val formattedPhone = formatNumberToWhatsApp(phone)
+    if (formattedPhone.isEmpty()) {
+        Toast.makeText(context, "Telefone inválido ou vazio para envio.", Toast.LENGTH_SHORT).show()
+        return
+    }
+    try {
+        val url = "https://api.whatsapp.com/send?phone=$formattedPhone&text=${Uri.encode(message)}"
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            data = Uri.parse(url)
+            setPackage(if (useBusiness) "com.whatsapp.w4b" else "com.whatsapp")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    } catch (e: Exception) {
+        // Fallback to launch generic chooser/url if preferred app isn't installed
+        try {
+            val url = "https://api.whatsapp.com/send?phone=$formattedPhone&text=${Uri.encode(message)}"
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+        } catch (ex: Exception) {
+            Toast.makeText(context, "WhatsApp/WhatsApp Business não localizado no aparelho.", Toast.LENGTH_LONG).show()
+        }
     }
 }
 

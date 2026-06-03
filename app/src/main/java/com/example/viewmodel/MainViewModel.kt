@@ -40,8 +40,39 @@ class MainViewModel(
 
     // User settings: Custom owner name (usuario_android)
     private val sharedPrefs = application.getSharedPreferences("extrai_cartao_prefs", Context.MODE_PRIVATE)
-    var userName by mutableStateOf(sharedPrefs.getString("user_name", "Facundo") ?: "Facundo")
+    var userName by mutableStateOf("")
         private set
+
+    init {
+        // Pre-populate with retrieved Google account username, or default to facbentes
+        val savedName = sharedPrefs.getString("user_name", null)
+        if (savedName == null) {
+            val googleName = getGoogleAccountLabel(application)
+            userName = googleName.ifEmpty { "facbentes" }
+            sharedPrefs.edit().putString("user_name", userName).apply()
+        } else {
+            userName = savedName
+        }
+    }
+
+    private fun getGoogleAccountLabel(context: Context): String {
+        try {
+            val am = android.accounts.AccountManager.get(context)
+            val accounts = am.getAccountsByType("com.google")
+            if (accounts.isNotEmpty()) {
+                val email = accounts[0].name
+                if (email.contains("@")) {
+                    return email.substringBefore("@")
+                }
+                return email
+            }
+        } catch (e: SecurityException) {
+            // Permission checked at runtime or not granted yet
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return "facbentes" // Personalized default fallback based on metadata info
+    }
 
     // Scan operations state
     var isScanning by mutableStateOf(false)
@@ -82,6 +113,8 @@ class MainViewModel(
                 parsedAddress = ""
                 parsedObservations = ""
                 scanError = null
+                // Directly trigger Gemini extraction on captured image
+                analyzeCardImage()
             }
         }
     }
