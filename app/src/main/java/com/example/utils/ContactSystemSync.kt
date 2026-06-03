@@ -31,7 +31,8 @@ object ContactSystemSync {
         address: String,
         instagram: String,
         observations: String,
-        imageBase64: String
+        imageBase64: String,
+        useWhatsAppBusiness: Boolean = false
     ): Long? {
         val resolver = context.contentResolver
         val ops = ArrayList<ContentProviderOperation>()
@@ -98,6 +99,9 @@ object ContactSystemSync {
             append("$MARKER_TAG\n")
             if (instagram.isNotBlank()) {
                 append("Instagram: $instagram\n")
+            }
+            if (useWhatsAppBusiness) {
+                append("PreferWhatsAppBusiness: true\n")
             }
             if (observations.isNotBlank()) {
                 append("Observations: $observations\n")
@@ -187,6 +191,7 @@ object ContactSystemSync {
             var imageBase64 = ""
             var instagram = ""
             var observations = ""
+            var useWhatsAppBusiness = false
 
             // Parse Note metadata
             val rawNote = notesMap[rawId] ?: ""
@@ -197,6 +202,8 @@ object ContactSystemSync {
                 if (trimLine == MARKER_TAG) continue
                 if (trimLine.startsWith("Instagram:")) {
                     instagram = trimLine.substringAfter("Instagram:").trim()
+                } else if (trimLine.startsWith("PreferWhatsAppBusiness:")) {
+                    useWhatsAppBusiness = trimLine.substringAfter("PreferWhatsAppBusiness:").trim().toBoolean()
                 } else if (trimLine.startsWith("Observations:")) {
                     cleanObs.append(trimLine.substringAfter("Observations:").trim()).append("\n")
                 } else if (trimLine.isNotEmpty()) {
@@ -255,7 +262,8 @@ object ContactSystemSync {
                     observations = observations,
                     imageBase64 = imageBase64,
                     createdAt = System.currentTimeMillis(),
-                    instagram = instagram
+                    instagram = instagram,
+                    useWhatsAppBusiness = useWhatsAppBusiness
                 )
             )
         }
@@ -320,7 +328,8 @@ object ContactSystemSync {
                     address = rc.address,
                     instagram = rc.instagram,
                     observations = rc.observations,
-                    imageBase64 = rc.imageBase64
+                    imageBase64 = rc.imageBase64,
+                    useWhatsAppBusiness = rc.useWhatsAppBusiness
                 )
             } else {
                 Log.i(TAG, "Contact already exists in system contacts, skipping: ${rc.name}")

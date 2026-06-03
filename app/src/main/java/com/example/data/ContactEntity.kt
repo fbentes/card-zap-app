@@ -13,5 +13,6 @@ data class ContactEntity(
     val observations: String,
     val imageBase64: String, // Storing base64 JPEG of the business card image
     val createdAt: Long = System.currentTimeMillis(),
-    val instagram: String = ""
+    val instagram: String = "",
+    val useWhatsAppBusiness: Boolean = false
 )

@@ -238,8 +238,7 @@ class MainViewModel(
             val context = getApplication<Application>()
             if (ContactSystemSync.hasContactsPermissions(context)) {
                 try {
-                    // Try to migrate any local Room database contacts that are not yet in AndroidContacts
-                    // This solves: "pegar os dados já existentes no apk instalado (antes de sobrepor) e salvar na minha lista"
+                    // 1. Try to migrate any local Room database contacts that are not yet in AndroidContacts
                     val localContacts = repository.allContacts.first()
                     if (localContacts.isNotEmpty()) {
                         ContactSystemSync.migrateRoomContactsToSystem(context, localContacts)
@@ -248,13 +247,32 @@ class MainViewModel(
                     Log.e("MainViewModel", "Migration from Room to system contacts failed: ${e.message}", e)
                 }
 
-                // Query our tagged system contacts from Android Contacts ContentProvider
+                // 2. Fetch system contacts and see if they need to be populated back to Room (e.g. after reinstall)
                 try {
                     val systemList = ContactSystemSync.fetchSystemContacts(context)
-                    _contactsList.value = systemList
+                    val localContactsAfter = repository.allContacts.first()
+                    for (sc in systemList) {
+                        val existsInRoom = localContactsAfter.any { lc ->
+                            val cleanSc = sc.primaryPhone.replace("\\D".toRegex(), "")
+                            val cleanLc = lc.primaryPhone.replace("\\D".toRegex(), "")
+                            (cleanSc.isNotEmpty() && cleanSc == cleanLc) || sc.name.trim().equals(lc.name.trim(), ignoreCase = true)
+                        }
+                        if (!existsInRoom) {
+                            Log.i("MainViewModel", "Restoring system contact to Room db: ${sc.name}")
+                            repository.insertContact(sc.copy(id = 0)) // insert fresh row
+                        }
+                    }
+
+                    // Re-read local contacts after syncing system contacts to Room
+                    val updatedLocalContacts = repository.allContacts.first()
+                    // Merge lists to be absolutely sure both data sources are presented with no duplicates
+                    val merged = (systemList + updatedLocalContacts).distinctBy {
+                        val cleanP = it.primaryPhone.replace("\\D".toRegex(), "")
+                        if (cleanP.isNotEmpty()) "phone:$cleanP" else "name:${it.name.lowercase().trim()}"
+                    }
+                    _contactsList.value = merged
                 } catch (e: Exception) {
-                    Log.e("MainViewModel", "Failed to query system contacts: ${e.message}", e)
-                    // If content provider query fails, fallback to Room database!
+                    Log.e("MainViewModel", "Failed to query system contacts, falling back to local: ${e.message}", e)
                     repository.allContacts.collect { roomList ->
                         _contactsList.value = roomList
                     }
@@ -269,7 +287,7 @@ class MainViewModel(
     }
 
     // Save contact to modern Room database and system Contacts
-    fun saveContact() {
+    fun saveContact(useWhatsAppBusiness: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
             val entity = ContactEntity(
                 name = parsedName,
@@ -278,7 +296,8 @@ class MainViewModel(
                 address = parsedAddress,
                 observations = parsedObservations,
                 imageBase64 = capturedImageBase64 ?: "",
-                instagram = parsedInstagram
+                instagram = parsedInstagram,
+                useWhatsAppBusiness = useWhatsAppBusiness
             )
             // Insert in SQLite/Room local database
             repository.insertContact(entity)
@@ -294,7 +313,8 @@ class MainViewModel(
                     address = entity.address,
                     instagram = entity.instagram,
                     observations = entity.observations,
-                    imageBase64 = entity.imageBase64
+                    imageBase64 = entity.imageBase64,
+                    useWhatsAppBusiness = useWhatsAppBusiness
                 )
             }
             
@@ -327,7 +347,8 @@ class MainViewModel(
                     address = contact.address,
                     instagram = contact.instagram,
                     observations = contact.observations,
-                    imageBase64 = contact.imageBase64
+                    imageBase64 = contact.imageBase64,
+                    useWhatsAppBusiness = contact.useWhatsAppBusiness
                 )
                 
                 // Also update Room Database
