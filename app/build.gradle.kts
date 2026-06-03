@@ -58,10 +58,10 @@ android {
   testOptions { unitTests { isIncludeAndroidResources = true } }
 }
 
-// Configure the Secrets Gradle Plugin to use .env and .env.example files
+// Configure the Secrets Gradle Plugin to use gemini_api_key.env and .env.example files
 // to match the convention used in Web projects.
 secrets {
-  propertiesFileName = ".env"
+  propertiesFileName = "gemini_api_key.env"
   defaultPropertiesFileName = ".env.example"
 }
 

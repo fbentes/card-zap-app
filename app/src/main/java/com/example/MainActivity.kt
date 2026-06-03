@@ -87,6 +87,34 @@ fun MainScreen(viewModel: MainViewModel) {
     var showSettingsDialog by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
 
+    val contactsPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val readGranted = permissions[Manifest.permission.READ_CONTACTS] ?: false
+        val writeGranted = permissions[Manifest.permission.WRITE_CONTACTS] ?: false
+        if (readGranted && writeGranted) {
+            viewModel.refreshContactsList()
+            Toast.makeText(context, "Permissão de contatos concedida!", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(context, "Permissão de contatos negada. Usando banco de dados local.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        val hasRead = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
+        val hasWrite = ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_CONTACTS) == PackageManager.PERMISSION_GRANTED
+        if (!hasRead || !hasWrite) {
+            contactsPermissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.READ_CONTACTS,
+                    Manifest.permission.WRITE_CONTACTS
+                )
+            )
+        } else {
+            viewModel.refreshContactsList()
+        }
+    }
+
     val tempFile = remember { File(context.cacheDir, "camera_capture.jpg") }
     val tempUri = remember {
         FileProvider.getUriForFile(
@@ -328,9 +356,24 @@ fun ScanReviewLayout(
     val context = LocalContext.current
     val scrollState = rememberScrollState()
 
-    var sendToWhatsApp by remember { mutableStateOf(true) }
-    var useBusinessWhatsApp by remember { mutableStateOf(false) }
+    val isWhatsAppInstalled = remember(context) { isAppInstalled(context, "com.whatsapp") }
+    val isWhatsAppBusinessInstalled = remember(context) { isAppInstalled(context, "com.whatsapp.w4b") }
+
+    // If on emulator / no apps detected, show normal as fallback option so layout isn't empty, otherwise show actual installed apps
+    val showNormal = isWhatsAppInstalled || (!isWhatsAppInstalled && !isWhatsAppBusinessInstalled)
+    val showBusiness = isWhatsAppBusinessInstalled
+
+    var sendViaNormal by remember { mutableStateOf(isWhatsAppInstalled) }
+    var sendViaBusiness by remember { mutableStateOf(isWhatsAppBusinessInstalled) }
+    var followOnInstagram by remember { mutableStateOf(true) }
     var customMessage by remember { mutableStateOf("") }
+
+    // Ensure we start with standard option checked if on emulator where no app is detected
+    LaunchedEffect(isWhatsAppInstalled, isWhatsAppBusinessInstalled) {
+        if (!isWhatsAppInstalled && !isWhatsAppBusinessInstalled) {
+            sendViaNormal = true
+        }
+    }
 
     val defaultMsg = viewModel.getWhatsAppMessage()
     LaunchedEffect(viewModel.parsedName, viewModel.userName) {
@@ -371,30 +414,6 @@ fun ScanReviewLayout(
             }
         }
 
-        Button(
-            onClick = { viewModel.analyzeCardImage() },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(52.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = MaterialTheme.colorScheme.tertiary,
-                contentColor = MaterialTheme.colorScheme.onTertiary
-            ),
-            enabled = !viewModel.isScanning,
-            shape = RoundedCornerShape(12.dp)
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Icon(Icons.Default.Info, contentDescription = null)
-                Text(
-                    text = if (viewModel.isScanning) "Analisando com IA..." else "Extrair Dados com IA",
-                    fontWeight = FontWeight.Bold
-                )
-            }
-        }
-
         if (viewModel.isScanning) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -409,7 +428,7 @@ fun ScanReviewLayout(
                 ) {
                     CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
                     Text(
-                        text = "A IA do Gemini está analisando o layout do cartão para extrair nome, telefones (detectando WhatsApp), endereço e serviços de forma inteligente...",
+                        text = "A IA do Gemini está analisando o layout do cartão para extrair nome, telefones (detectando WhatsApp), Instagram, endereço e serviços de forma inteligente...",
                         textAlign = TextAlign.Center,
                         fontSize = 13.sp,
                         color = MaterialTheme.colorScheme.onPrimaryContainer
@@ -471,6 +490,16 @@ fun ScanReviewLayout(
         )
 
         OutlinedTextField(
+            value = viewModel.parsedInstagram,
+            onValueChange = { viewModel.parsedInstagram = it },
+            label = { Text("Instagram (perfil, arroba ou link):") },
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(8.dp),
+            leadingIcon = { Icon(Icons.Default.Person, contentDescription = null, tint = Color(0xFFE1306C)) },
+            supportingText = { Text("Perfil de Instagram extraído do cartão de visita.") }
+        )
+
+        OutlinedTextField(
             value = viewModel.parsedAddress,
             onValueChange = { viewModel.parsedAddress = it },
             label = { Text("Endereço:") },
@@ -498,78 +527,102 @@ fun ScanReviewLayout(
                 modifier = Modifier.padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Checkbox(
-                        checked = sendToWhatsApp,
-                        onCheckedChange = { sendToWhatsApp = it }
-                    )
+                Text(
+                    text = "Opções de Envio do WhatsApp",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+
+                if (showNormal) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = sendViaNormal,
+                            onCheckedChange = { sendViaNormal = it }
+                        )
+                        Text(text = "Enviar via WhatsApp Padrão", fontSize = 13.sp)
+                    }
+                }
+
+                if (showBusiness) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = sendViaBusiness,
+                            onCheckedChange = { sendViaBusiness = it }
+                        )
+                        Text(text = "Enviar via WhatsApp Business", fontSize = 13.sp)
+                    }
+                }
+
+                if (!isWhatsAppInstalled && !isWhatsAppBusinessInstalled) {
                     Text(
-                        text = "Enviar mensagem de apresentação ao salvar",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 14.sp,
-                        color = MaterialTheme.colorScheme.onSurface
+                        text = "(Nenhum WhatsApp detectado localmente no aparelho. Padrão ativo para testes)",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(start = 4.dp, bottom = 4.dp)
                     )
                 }
 
-                if (sendToWhatsApp) {
+                Spacer(modifier = Modifier.height(4.dp))
+
+                val isMessageEnabled = sendViaNormal || sendViaBusiness
+
+                Text(
+                    text = "Mensagem para Enviar (Habilitado se WhatsApp selecionado):",
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 12.sp,
+                    color = if (isMessageEnabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                    modifier = Modifier.padding(start = 4.dp)
+                )
+
+                OutlinedTextField(
+                    value = customMessage,
+                    onValueChange = { customMessage = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = isMessageEnabled,
+                    maxLines = 8,
+                    minLines = 3,
+                    textStyle = MaterialTheme.typography.bodyMedium,
+                    shape = RoundedCornerShape(8.dp),
+                    supportingText = { Text("Lembrete: O template utiliza seu nome de usuário (${viewModel.userName}).", fontSize = 10.sp) }
+                )
+            }
+        }
+
+        // Instagram Checkbox (Optional)
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Checkbox(
+                    checked = followOnInstagram,
+                    onCheckedChange = { followOnInstagram = it }
+                )
+                Column(modifier = Modifier.padding(start = 8.dp)) {
                     Text(
-                        text = "Selecione o canal de envio (Remetente):",
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.padding(start = 12.dp, top = 4.dp)
+                        text = "Seguir no Instagram automaticamente ao salvar",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurface
                     )
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(start = 12.dp),
-                        horizontalArrangement = Arrangement.spacedBy(16.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.clickable { useBusinessWhatsApp = false }
-                        ) {
-                            RadioButton(
-                                selected = !useBusinessWhatsApp,
-                                onClick = { useBusinessWhatsApp = false }
-                            )
-                            Text("WhatsApp Padrão", fontSize = 13.sp)
-                        }
-
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.clickable { useBusinessWhatsApp = true }
-                        ) {
-                            RadioButton(
-                                selected = useBusinessWhatsApp,
-                                onClick = { useBusinessWhatsApp = true }
-                            )
-                            Text("WhatsApp Business", fontSize = 13.sp)
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(4.dp))
-
                     Text(
-                        text = "Mensagem para Enviar (Personalize se desejar):",
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.padding(start = 12.dp)
-                    )
-
-                    OutlinedTextField(
-                        value = customMessage,
-                        onValueChange = { customMessage = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        maxLines = 8,
-                        minLines = 3,
-                        textStyle = MaterialTheme.typography.bodyMedium,
-                        shape = RoundedCornerShape(8.dp),
-                        supportingText = { Text("Lembrete: A variável de usuário Google foi configurada como $ {usuario_android} (definida pelo campo usuario_android).", fontSize = 10.sp) }
+                        text = "Se houver contato do Instagram e o aplicativo local estiver instalado.",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
@@ -598,8 +651,9 @@ fun ScanReviewLayout(
                     } else {
                         val phone = viewModel.parsedPrimaryPhone
                         val msgToSubmit = customMessage
-                        val shouldOpenWhatsApp = sendToWhatsApp
-                        val isBusiness = useBusinessWhatsApp
+                        val shouldOpenWhatsApp = sendViaNormal || sendViaBusiness
+                        val isBusiness = sendViaBusiness && !sendViaNormal
+                        val instagramHandle = viewModel.parsedInstagram
 
                         viewModel.saveContact()
                         Toast.makeText(context, "Contato salvo com sucesso!", Toast.LENGTH_SHORT).show()
@@ -608,8 +662,12 @@ fun ScanReviewLayout(
                             if (phone.isNotBlank()) {
                                 openWhatsAppChat(context, phone, msgToSubmit, isBusiness)
                             } else {
-                                Toast.makeText(context, "Contato salvo, mas telefone principal está vazio para WhatsApp.", Toast.LENGTH_LONG).show()
+                                Toast.makeText(context, "Contato salvo, mas sem telefone para envio do WhatsApp.", Toast.LENGTH_LONG).show()
                             }
+                        }
+
+                        if (followOnInstagram && instagramHandle.isNotBlank()) {
+                            openInstagramProfile(context, instagramHandle)
                         }
                     }
                 },
@@ -948,6 +1006,38 @@ fun SettingsDialog(
     }
 }
 
+fun isAppInstalled(context: Context, packageName: String): Boolean {
+    val pm = context.packageManager
+    return try {
+        pm.getPackageInfo(packageName, 0)
+        true
+    } catch (e: Exception) {
+        false
+    }
+}
+
+fun openInstagramProfile(context: Context, username: String) {
+    val cleanUsername = username.replace("@", "").trim()
+    if (cleanUsername.isEmpty()) return
+    val uri = Uri.parse("http://instagram.com/_u/$cleanUsername")
+    val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+        setPackage("com.instagram.android")
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    try {
+        context.startActivity(intent)
+    } catch (e: Exception) {
+        try {
+            val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://instagram.com/$cleanUsername")).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(browserIntent)
+        } catch (ex: Exception) {
+            Toast.makeText(context, "Instagram não pôde ser aberto.", Toast.LENGTH_SHORT).show()
+        }
+    }
+}
+
 fun formatNumberToWhatsApp(phone: String): String {
     val digits = phone.filter { it.isDigit() }
     return if (digits.length in 10..11) {
@@ -1075,6 +1165,15 @@ fun ContactDetailsDialog(
                     DetailTextItem(icon = Icons.Default.Place, label = "Endereço:", value = contact.address)
                 }
 
+                if (contact.instagram.isNotEmpty()) {
+                    DetailTextItem(
+                        icon = Icons.Default.Person, 
+                        label = "Instagram:", 
+                        value = contact.instagram,
+                        iconColor = Color(0xFFE1306C)
+                    )
+                }
+
                 if (contact.observations.isNotEmpty()) {
                     DetailTextItem(icon = Icons.Default.Info, label = "Serviços / Observações:", value = contact.observations)
                 }
@@ -1112,6 +1211,25 @@ fun ContactDetailsDialog(
                     ) {
                         Icon(Icons.Default.Share, contentDescription = null, tint = Color.White)
                         Text("Enviar Mensagem no WhatsApp", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    }
+                }
+
+                if (contact.instagram.isNotEmpty()) {
+                    Button(
+                        onClick = {
+                            openInstagramProfile(context, contact.instagram)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE1306C))
+                    ) {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.Share, contentDescription = null, tint = Color.White)
+                            Text("Seguir no Instagram", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        }
                     }
                 }
 
@@ -1208,6 +1326,7 @@ fun EditContactDialog(
     var name by remember { mutableStateOf(contact.name) }
     var primaryPhone by remember { mutableStateOf(contact.primaryPhone) }
     var secondaryPhone by remember { mutableStateOf(contact.secondaryPhone) }
+    var instagram by remember { mutableStateOf(contact.instagram) }
     var address by remember { mutableStateOf(contact.address) }
     var observations by remember { mutableStateOf(contact.observations) }
 
@@ -1263,6 +1382,15 @@ fun EditContactDialog(
                 )
 
                 OutlinedTextField(
+                    value = instagram,
+                    onValueChange = { instagram = it },
+                    label = { Text("Instagram:") },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(8.dp),
+                    leadingIcon = { Icon(Icons.Default.Person, contentDescription = null, tint = Color(0xFFE1306C)) }
+                )
+
+                OutlinedTextField(
                     value = address,
                     onValueChange = { address = it },
                     label = { Text("Endereço:") },
@@ -1296,6 +1424,7 @@ fun EditContactDialog(
                                         name = name,
                                         primaryPhone = primaryPhone,
                                         secondaryPhone = secondaryPhone,
+                                        instagram = instagram,
                                         address = address,
                                         observations = observations
                                     )

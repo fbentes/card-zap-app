@@ -19,7 +19,13 @@ import com.example.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.stateIn
+import com.example.utils.ContactSystemSync
+import android.util.Log
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
@@ -30,13 +36,9 @@ class MainViewModel(
     private val repository: ContactRepository
 ) : AndroidViewModel(application) {
 
-    // Contacts state flow from Room
-    val contacts: StateFlow<List<ContactEntity>> = repository.allContacts
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = emptyList()
-        )
+    // Contacts state flow from native Android phonebook / Room fallback
+    private val _contactsList = MutableStateFlow<List<ContactEntity>>(emptyList())
+    val contacts: StateFlow<List<ContactEntity>> = _contactsList.asStateFlow()
 
     // User settings: Custom owner name (usuario_android)
     private val sharedPrefs = application.getSharedPreferences("extrai_cartao_prefs", Context.MODE_PRIVATE)
@@ -53,6 +55,9 @@ class MainViewModel(
         } else {
             userName = savedName
         }
+        
+        // Initial load and sync/migration of existing contacts!
+        refreshContactsList()
     }
 
     private fun getGoogleAccountLabel(context: Context): String {
@@ -88,6 +93,7 @@ class MainViewModel(
     var parsedSecondaryPhone by mutableStateOf("")
     var parsedAddress by mutableStateOf("")
     var parsedObservations by mutableStateOf("")
+    var parsedInstagram by mutableStateOf("")
 
     // List of states for viewing/editing saved contacts
     var showingManualAdd by mutableStateOf(false)
@@ -112,6 +118,7 @@ class MainViewModel(
                 parsedSecondaryPhone = ""
                 parsedAddress = ""
                 parsedObservations = ""
+                parsedInstagram = ""
                 scanError = null
                 // Directly trigger Gemini extraction on captured image
                 analyzeCardImage()
@@ -126,6 +133,7 @@ class MainViewModel(
         parsedSecondaryPhone = ""
         parsedAddress = ""
         parsedObservations = ""
+        parsedInstagram = ""
         scanError = null
         isScanning = false
     }
@@ -152,6 +160,7 @@ class MainViewModel(
                     - secondaryPhone: Outro telefone presente no cartão (como fixo ou outro celular), se houver. Se não houver, deixe-o em branco/nulo.
                     - address: O endereço completo constante no cartão (rua, avenida, lote, quadra, bairro, cidade, estado). Se não houver, deixe-o em branco/nulo.
                     - observations: Os serviços prestados listados no cartão de forma estruturada (exemplo: 'Balanceamento, Alinhamento, Cambagem, Freio, Suspensão, Reforma de Rodas, Polimento de Rodas, Desempeno') ou observações principais. Se não houver, deixe-o em branco/nulo.
+                    - instagram: O contato de Instagram (@usuario ou perfil/handle do Instagram) presente no cartão, se houver. Se não houver, preencha como string vazia "" ou nulo.
 
                     Regras cruciais:
                     1. Retorne APENAS o JSON válido. Não coloque nenhum bloco explicativo, markdown ```json ou introdução comercial. Retorne o JSON diretamente que coincida exatamente com a estrutura de classe desejada.
@@ -186,12 +195,34 @@ class MainViewModel(
                         parsedSecondaryPhone = parsed.secondaryPhone ?: ""
                         parsedAddress = parsed.address ?: ""
                         parsedObservations = parsed.observations ?: ""
+                        parsedInstagram = parsed.instagram ?: ""
                     } else {
                         throw Exception("Não foi possível decodificar os dados retornados no JSON.")
                     }
                     isScanning = false
                 }
 
+            } catch (e: retrofit2.HttpException) {
+                val errorBody = try {
+                    e.response()?.errorBody()?.string()
+                } catch (ex: Exception) {
+                    null
+                }
+                val errorMessage = if (!errorBody.isNullOrBlank()) {
+                    try {
+                        val json = org.json.JSONObject(errorBody)
+                        val errorObj = json.optJSONObject("error")
+                        errorObj?.optString("message") ?: errorBody
+                    } catch (ex: Exception) {
+                        errorBody
+                    }
+                } else {
+                    e.message()
+                }
+                withContext(Dispatchers.Main) {
+                    scanError = "Falha ao escanear o cartão: HTTP ${e.code()} - $errorMessage"
+                    isScanning = false
+                }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     scanError = "Falha ao escanear o cartão: ${e.localizedMessage ?: e.message}"
@@ -201,7 +232,43 @@ class MainViewModel(
         }
     }
 
-    // Save contact to modern Room database
+    // Read directly from Contacts system or fallback to cached Room database
+    fun refreshContactsList() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val context = getApplication<Application>()
+            if (ContactSystemSync.hasContactsPermissions(context)) {
+                try {
+                    // Try to migrate any local Room database contacts that are not yet in AndroidContacts
+                    // This solves: "pegar os dados já existentes no apk instalado (antes de sobrepor) e salvar na minha lista"
+                    val localContacts = repository.allContacts.first()
+                    if (localContacts.isNotEmpty()) {
+                        ContactSystemSync.migrateRoomContactsToSystem(context, localContacts)
+                    }
+                } catch (e: Exception) {
+                    Log.e("MainViewModel", "Migration from Room to system contacts failed: ${e.message}", e)
+                }
+
+                // Query our tagged system contacts from Android Contacts ContentProvider
+                try {
+                    val systemList = ContactSystemSync.fetchSystemContacts(context)
+                    _contactsList.value = systemList
+                } catch (e: Exception) {
+                    Log.e("MainViewModel", "Failed to query system contacts: ${e.message}", e)
+                    // If content provider query fails, fallback to Room database!
+                    repository.allContacts.collect { roomList ->
+                        _contactsList.value = roomList
+                    }
+                }
+            } else {
+                // Permissions not granted yet. Falling back to displaying Room contents.
+                repository.allContacts.collect { roomList ->
+                    _contactsList.value = roomList
+                }
+            }
+        }
+    }
+
+    // Save contact to modern Room database and system Contacts
     fun saveContact() {
         viewModelScope.launch(Dispatchers.IO) {
             val entity = ContactEntity(
@@ -210,9 +277,30 @@ class MainViewModel(
                 secondaryPhone = parsedSecondaryPhone,
                 address = parsedAddress,
                 observations = parsedObservations,
-                imageBase64 = capturedImageBase64 ?: ""
+                imageBase64 = capturedImageBase64 ?: "",
+                instagram = parsedInstagram
             )
+            // Insert in SQLite/Room local database
             repository.insertContact(entity)
+            
+            // Insert into native Android system contacts
+            val context = getApplication<Application>()
+            if (ContactSystemSync.hasContactsPermissions(context)) {
+                ContactSystemSync.insertSystemContact(
+                    context = context,
+                    name = entity.name,
+                    primaryPhone = entity.primaryPhone,
+                    secondaryPhone = entity.secondaryPhone,
+                    address = entity.address,
+                    instagram = entity.instagram,
+                    observations = entity.observations,
+                    imageBase64 = entity.imageBase64
+                )
+            }
+            
+            // Reload contacts listing (from native Android contacts list)
+            refreshContactsList()
+            
             withContext(Dispatchers.Main) {
                 clearScannedState()
                 showingManualAdd = false
@@ -220,10 +308,49 @@ class MainViewModel(
         }
     }
 
-    // Save edited Contact back to database
+    // Save edited Contact back to database and system contacts
     fun saveEditedContact(contact: ContactEntity) {
         viewModelScope.launch(Dispatchers.IO) {
-            repository.updateContact(contact)
+            val context = getApplication<Application>()
+            if (ContactSystemSync.hasContactsPermissions(context)) {
+                // If it is a system contact, delete older raw contact copy
+                if (contact.id > 0) {
+                    ContactSystemSync.deleteSystemContact(context, contact.id)
+                }
+                
+                // Re-insert as a fresh Raw contact with updated values
+                ContactSystemSync.insertSystemContact(
+                    context = context,
+                    name = contact.name,
+                    primaryPhone = contact.primaryPhone,
+                    secondaryPhone = contact.secondaryPhone,
+                    address = contact.address,
+                    instagram = contact.instagram,
+                    observations = contact.observations,
+                    imageBase64 = contact.imageBase64
+                )
+                
+                // Also update Room Database
+                try {
+                    val localMatches = repository.allContacts.first().filter { 
+                        it.primaryPhone == contact.primaryPhone || it.name == contact.name 
+                    }
+                    if (localMatches.isNotEmpty()) {
+                        for (match in localMatches) {
+                            repository.updateContact(contact.copy(id = match.id))
+                        }
+                    } else {
+                        repository.insertContact(contact.copy(id = 0))
+                    }
+                } catch (e: Exception) {
+                    Log.e("MainViewModel", "Failed to keep Room edit in sync: ${e.message}")
+                }
+            } else {
+                repository.updateContact(contact)
+            }
+            
+            refreshContactsList()
+            
             withContext(Dispatchers.Main) {
                 selectedContact = contact
                 editModeActive = false
@@ -231,12 +358,35 @@ class MainViewModel(
         }
     }
 
-    // Delete contact
+    // Delete contact from database and system contacts
     fun deleteContact(contact: ContactEntity) {
         viewModelScope.launch(Dispatchers.IO) {
-            repository.deleteContact(contact)
+            val context = getApplication<Application>()
+            if (ContactSystemSync.hasContactsPermissions(context)) {
+                if (contact.id > 0) {
+                    ContactSystemSync.deleteSystemContact(context, contact.id)
+                }
+                
+                // Also remove matching rows in Room so they don't get re-migrated
+                try {
+                    val localMatches = repository.allContacts.first().filter {
+                        it.primaryPhone == contact.primaryPhone || it.name == contact.name
+                    }
+                    for (match in localMatches) {
+                        repository.deleteContact(match)
+                    }
+                } catch (e: Exception) {
+                    Log.e("MainViewModel", "Failed to remove Room counterparts: ${e.message}")
+                }
+            } else {
+                repository.deleteContact(contact)
+            }
+            
+            refreshContactsList()
+            
             withContext(Dispatchers.Main) {
-                if (selectedContact?.id == contact.id) {
+                if (selectedContact?.id == contact.id || 
+                    (selectedContact?.name == contact.name && selectedContact?.primaryPhone == contact.primaryPhone)) {
                     selectedContact = null
                     editModeActive = false
                 }

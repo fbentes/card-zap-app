@@ -48,5 +48,6 @@ data class ParsedContact(
     @Json(name = "primaryPhone") val primaryPhone: String,
     @Json(name = "secondaryPhone") val secondaryPhone: String?,
     @Json(name = "address") val address: String?,
-    @Json(name = "observations") val observations: String?
+    @Json(name = "observations") val observations: String?,
+    @Json(name = "instagram") val instagram: String? = null
 )
