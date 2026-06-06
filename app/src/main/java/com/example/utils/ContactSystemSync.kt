@@ -22,6 +22,48 @@ object ContactSystemSync {
         return readPerm && writePerm
     }
 
+    // Helper to search for an existing com.google account on the device
+    fun getGoogleAccount(context: Context): Pair<String?, String?> {
+        if (!hasContactsPermissions(context)) return Pair(null, null)
+        val resolver = context.contentResolver
+        val projection = arrayOf(
+            ContactsContract.RawContacts.ACCOUNT_TYPE,
+            ContactsContract.RawContacts.ACCOUNT_NAME
+        )
+        try {
+            resolver.query(
+                ContactsContract.RawContacts.CONTENT_URI,
+                projection,
+                "${ContactsContract.RawContacts.ACCOUNT_TYPE} = ?",
+                arrayOf("com.google"),
+                null
+            )?.use { cursor ->
+                val typeCol = cursor.getColumnIndex(ContactsContract.RawContacts.ACCOUNT_TYPE)
+                val nameCol = cursor.getColumnIndex(ContactsContract.RawContacts.ACCOUNT_NAME)
+                while (cursor.moveToNext()) {
+                    val type = if (typeCol >= 0) cursor.getString(typeCol) else null
+                    val name = if (nameCol >= 0) cursor.getString(nameCol) else null
+                    if (!type.isNullOrBlank() && !name.isNullOrBlank()) {
+                        return Pair(type, name)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error seeking com.google account from RawContacts: ${e.message}")
+        }
+        
+        try {
+            val accounts = android.accounts.AccountManager.get(context).getAccountsByType("com.google")
+            if (accounts.isNotEmpty()) {
+                return Pair("com.google", accounts[0].name)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "AccountManager lookup failed or missing permissions: ${e.message}")
+        }
+
+        return Pair(null, null)
+    }
+
     // Insert a contact directly into the Android system's native phonebook
     fun insertSystemContact(
         context: Context,
@@ -32,15 +74,18 @@ object ContactSystemSync {
         instagram: String,
         observations: String,
         imageBase64: String,
-        useWhatsAppBusiness: Boolean = false
+        useWhatsAppBusiness: Boolean = false,
+        instagramFollowed: Boolean = false
     ): Long? {
         val resolver = context.contentResolver
         val ops = ArrayList<ContentProviderOperation>()
 
+        val googleAcc = getGoogleAccount(context)
+
         // 1. Create a Raw Contact
         ops.add(ContentProviderOperation.newInsert(ContactsContract.RawContacts.CONTENT_URI)
-            .withValue(ContactsContract.RawContacts.ACCOUNT_TYPE, null)
-            .withValue(ContactsContract.RawContacts.ACCOUNT_NAME, null)
+            .withValue(ContactsContract.RawContacts.ACCOUNT_TYPE, googleAcc.first)
+            .withValue(ContactsContract.RawContacts.ACCOUNT_NAME, googleAcc.second)
             .build())
 
         // 2. Insert Name
@@ -103,6 +148,9 @@ object ContactSystemSync {
             if (useWhatsAppBusiness) {
                 append("PreferWhatsAppBusiness: true\n")
             }
+            if (instagramFollowed) {
+                append("InstagramFollowed: true\n")
+            }
             if (observations.isNotBlank()) {
                 append("Observations: $observations\n")
             }
@@ -125,7 +173,7 @@ object ContactSystemSync {
         }
     }
 
-    // Fetch all contacts from Android native phonebook matching our MARKER_TAG (#CardZap)
+    // Fetch all contacts from Android native phonebook
     fun fetchSystemContacts(context: Context): List<ContactEntity> {
         val contactList = ArrayList<ContactEntity>()
         val resolver = context.contentResolver
@@ -135,55 +183,28 @@ object ContactSystemSync {
             return emptyList()
         }
 
-        // Search for Notes containing #CardZap
-        val cursor = resolver.query(
-            ContactsContract.Data.CONTENT_URI,
-            arrayOf(
-                ContactsContract.Data.RAW_CONTACT_ID,
-                ContactsContract.CommonDataKinds.Note.NOTE
-            ),
-            "${ContactsContract.Data.MIMETYPE} = ? AND ${ContactsContract.CommonDataKinds.Note.NOTE} LIKE ?",
-            arrayOf(ContactsContract.CommonDataKinds.Note.CONTENT_ITEM_TYPE, "%$MARKER_TAG%"),
-            null
+        val projection = arrayOf(
+            ContactsContract.Data.RAW_CONTACT_ID,
+            ContactsContract.Data.MIMETYPE,
+            ContactsContract.Data.DATA1,
+            ContactsContract.Data.DATA2,
+            ContactsContract.Data.DATA15
         )
 
-        val matchingRawIds = HashSet<Long>()
-        val notesMap = HashMap<Long, String>()
-
-        cursor?.use {
-            val rawIdCol = it.getColumnIndex(ContactsContract.Data.RAW_CONTACT_ID)
-            val noteCol = it.getColumnIndex(ContactsContract.CommonDataKinds.Note.NOTE)
-            while (it.moveToNext()) {
-                val rawId = it.getLong(rawIdCol)
-                val note = it.getString(noteCol) ?: ""
-                if (note.contains(MARKER_TAG)) {
-                    matchingRawIds.add(rawId)
-                    notesMap[rawId] = note
-                }
-            }
-        }
-
-        if (matchingRawIds.isEmpty()) {
-            return emptyList()
-        }
-
-        // Fetch details for each identified RawContact
-        for (rawId in matchingRawIds) {
-            val dataCursor = resolver.query(
+        val cursor = try {
+            resolver.query(
                 ContactsContract.Data.CONTENT_URI,
-                arrayOf(
-                    ContactsContract.Data.MIMETYPE,
-                    ContactsContract.CommonDataKinds.StructuredName.DISPLAY_NAME,
-                    ContactsContract.CommonDataKinds.Phone.NUMBER,
-                    ContactsContract.CommonDataKinds.Phone.TYPE,
-                    ContactsContract.CommonDataKinds.StructuredPostal.FORMATTED_ADDRESS,
-                    ContactsContract.CommonDataKinds.Photo.PHOTO
-                ),
-                "${ContactsContract.Data.RAW_CONTACT_ID} = ?",
-                arrayOf(rawId.toString()),
-                null
+                projection,
+                null,
+                null,
+                "${ContactsContract.Data.RAW_CONTACT_ID} ASC"
             )
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to query ContactsContract.Data: ${e.message}", e)
+            null
+        }
 
+        class TempContact(val rawId: Long) {
             var name = ""
             var primaryPhone = ""
             var secondaryPhone = ""
@@ -192,83 +213,231 @@ object ContactSystemSync {
             var instagram = ""
             var observations = ""
             var useWhatsAppBusiness = false
+            var rawNote = ""
+        }
 
-            // Parse Note metadata
-            val rawNote = notesMap[rawId] ?: ""
-            val rawLines = rawNote.lines()
-            val cleanObs = StringBuilder()
-            for (line in rawLines) {
-                val trimLine = line.trim()
-                if (trimLine == MARKER_TAG) continue
-                if (trimLine.startsWith("Instagram:")) {
-                    instagram = trimLine.substringAfter("Instagram:").trim()
-                } else if (trimLine.startsWith("PreferWhatsAppBusiness:")) {
-                    useWhatsAppBusiness = trimLine.substringAfter("PreferWhatsAppBusiness:").trim().toBoolean()
-                } else if (trimLine.startsWith("Observations:")) {
-                    cleanObs.append(trimLine.substringAfter("Observations:").trim()).append("\n")
-                } else if (trimLine.isNotEmpty()) {
-                    cleanObs.append(trimLine).append("\n")
-                }
-            }
-            observations = cleanObs.toString().trim()
+        val tempContacts = LinkedHashMap<Long, TempContact>()
 
-            dataCursor?.use { dc ->
-                val mimeCol = dc.getColumnIndex(ContactsContract.Data.MIMETYPE)
-                val nameCol = dc.getColumnIndex(ContactsContract.CommonDataKinds.StructuredName.DISPLAY_NAME)
-                val phoneCol = dc.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
-                val phoneTypeCol = dc.getColumnIndex(ContactsContract.CommonDataKinds.Phone.TYPE)
-                val addressCol = dc.getColumnIndex(ContactsContract.CommonDataKinds.StructuredPostal.FORMATTED_ADDRESS)
-                val photoCol = dc.getColumnIndex(ContactsContract.CommonDataKinds.Photo.PHOTO)
+        cursor?.use { c ->
+            val rawIdCol = c.getColumnIndex(ContactsContract.Data.RAW_CONTACT_ID)
+            val mimeCol = c.getColumnIndex(ContactsContract.Data.MIMETYPE)
+            val data1Col = c.getColumnIndex(ContactsContract.Data.DATA1)
+            val data2Col = c.getColumnIndex(ContactsContract.Data.DATA2)
+            val blobCol = c.getColumnIndex(ContactsContract.Data.DATA15)
 
-                while (dc.moveToNext()) {
-                    val mimetype = dc.getString(mimeCol)
-                    when (mimetype) {
-                        ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE -> {
-                            name = dc.getString(nameCol) ?: ""
+            while (c.moveToNext()) {
+                val rawId = c.getLong(rawIdCol)
+                val mimetype = c.getString(mimeCol) ?: continue
+
+                val tc = tempContacts.getOrPut(rawId) { TempContact(rawId) }
+
+                when (mimetype) {
+                    ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE -> {
+                        val n = c.getString(data1Col)
+                        if (!n.isNullOrBlank()) {
+                            tc.name = n
                         }
-                        ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE -> {
-                            val phoneNum = dc.getString(phoneCol) ?: ""
-                            val type = dc.getInt(phoneTypeCol)
-                            if (type == ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE || primaryPhone.isEmpty()) {
-                                if (primaryPhone.isEmpty()) {
-                                    primaryPhone = phoneNum
+                    }
+                    ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE -> {
+                        val phoneNum = c.getString(data1Col)
+                        if (!phoneNum.isNullOrBlank()) {
+                            val type = c.getInt(data2Col)
+                            if (type == ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE || tc.primaryPhone.isEmpty()) {
+                                if (tc.primaryPhone.isEmpty()) {
+                                    tc.primaryPhone = phoneNum
                                 } else {
-                                    secondaryPhone = phoneNum
+                                    tc.secondaryPhone = phoneNum
                                 }
                             } else {
-                                secondaryPhone = phoneNum
+                                tc.secondaryPhone = phoneNum
                             }
                         }
-                        ContactsContract.CommonDataKinds.StructuredPostal.CONTENT_ITEM_TYPE -> {
-                            address = dc.getString(addressCol) ?: ""
+                    }
+                    ContactsContract.CommonDataKinds.StructuredPostal.CONTENT_ITEM_TYPE -> {
+                        val addr = c.getString(data1Col)
+                        if (!addr.isNullOrBlank()) {
+                            tc.address = addr
                         }
-                        ContactsContract.CommonDataKinds.Photo.CONTENT_ITEM_TYPE -> {
-                            val photoBytes = dc.getBlob(photoCol)
-                            if (photoBytes != null && photoBytes.isNotEmpty()) {
-                                imageBase64 = Base64.encodeToString(photoBytes, Base64.DEFAULT)
-                            }
+                    }
+                    ContactsContract.CommonDataKinds.Photo.CONTENT_ITEM_TYPE -> {
+                        val photoBytes = c.getBlob(blobCol)
+                        if (photoBytes != null && photoBytes.isNotEmpty()) {
+                            tc.imageBase64 = Base64.encodeToString(photoBytes, Base64.DEFAULT)
+                        }
+                    }
+                    ContactsContract.CommonDataKinds.Note.CONTENT_ITEM_TYPE -> {
+                        val note = c.getString(data1Col)
+                        if (!note.isNullOrBlank()) {
+                            tc.rawNote = note
                         }
                     }
                 }
             }
+        }
+
+        for ((rawId, tc) in tempContacts) {
+            // ONLY include contacts that contain our CardZap marker (MARKER_TAG) in the notes
+            if (!tc.rawNote.contains(MARKER_TAG)) {
+                continue
+            }
+
+            if (tc.name.isBlank() && tc.primaryPhone.isBlank() && tc.secondaryPhone.isBlank()) {
+                continue
+            }
+
+            var finalInstagram = ""
+            var finalUseWhatsAppBusiness = false
+            var finalObservations = ""
+            var finalInstagramFollowed = false
+
+            if (tc.rawNote.contains(MARKER_TAG)) {
+                val rawLines = tc.rawNote.lines()
+                val cleanObs = StringBuilder()
+
+                for (line in rawLines) {
+                    val trimLine = line.trim()
+                    if (trimLine == MARKER_TAG) continue
+                    if (trimLine.startsWith("Instagram:")) {
+                        finalInstagram = trimLine.substringAfter("Instagram:").trim()
+                    } else if (trimLine.startsWith("PreferWhatsAppBusiness:")) {
+                        finalUseWhatsAppBusiness = trimLine.substringAfter("PreferWhatsAppBusiness:").trim().toBoolean()
+                    } else if (trimLine.startsWith("InstagramFollowed:")) {
+                        finalInstagramFollowed = trimLine.substringAfter("InstagramFollowed:").trim().toBoolean()
+                    } else if (trimLine.startsWith("Observations:")) {
+                        cleanObs.append(trimLine.substringAfter("Observations:").trim()).append("\n")
+                    } else if (trimLine.isNotEmpty()) {
+                        cleanObs.append(trimLine).append("\n")
+                    }
+                }
+                finalObservations = cleanObs.toString().trim()
+            } else {
+                finalObservations = tc.rawNote.trim()
+            }
 
             contactList.add(
                 ContactEntity(
-                    id = rawId.toInt(), // raw id as the unique identifier for UI flow
-                    name = name.ifBlank { "Sem Nome" },
-                    primaryPhone = primaryPhone,
-                    secondaryPhone = secondaryPhone,
-                    address = address,
-                    observations = observations,
-                    imageBase64 = imageBase64,
+                    id = rawId.toInt(),
+                    name = tc.name.ifBlank { "Sem Nome" },
+                    primaryPhone = tc.primaryPhone,
+                    secondaryPhone = tc.secondaryPhone,
+                    address = tc.address,
+                    observations = finalObservations,
+                    imageBase64 = tc.imageBase64,
                     createdAt = System.currentTimeMillis(),
-                    instagram = instagram,
-                    useWhatsAppBusiness = useWhatsAppBusiness
+                    instagram = finalInstagram,
+                    useWhatsAppBusiness = finalUseWhatsAppBusiness,
+                    instagramFollowed = finalInstagramFollowed
                 )
             )
         }
 
         return contactList
+    }
+
+    // Update a contact directly in the Android system's native phonebook under the same RAW_CONTACT_ID
+    fun updateSystemContact(
+        context: Context,
+        rawContactId: Int,
+        name: String,
+        primaryPhone: String,
+        secondaryPhone: String,
+        address: String,
+        instagram: String,
+        observations: String,
+        imageBase64: String,
+        useWhatsAppBusiness: Boolean = false,
+        instagramFollowed: Boolean = false
+    ): Boolean {
+        if (!hasContactsPermissions(context)) return false
+        val resolver = context.contentResolver
+        val ops = ArrayList<ContentProviderOperation>()
+
+        // 1. Delete all existing Data rows for this RAW_CONTACT_ID
+        ops.add(ContentProviderOperation.newDelete(ContactsContract.Data.CONTENT_URI)
+            .withSelection("${ContactsContract.Data.RAW_CONTACT_ID} = ?", arrayOf(rawContactId.toString()))
+            .build())
+
+        // 2. Insert Name
+        ops.add(ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+            .withValue(ContactsContract.Data.RAW_CONTACT_ID, rawContactId)
+            .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE)
+            .withValue(ContactsContract.CommonDataKinds.StructuredName.DISPLAY_NAME, name)
+            .build())
+
+        // 3. Insert Primary Phone
+        if (primaryPhone.isNotBlank()) {
+            ops.add(ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+                .withValue(ContactsContract.Data.RAW_CONTACT_ID, rawContactId)
+                .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE)
+                .withValue(ContactsContract.CommonDataKinds.Phone.NUMBER, primaryPhone)
+                .withValue(ContactsContract.CommonDataKinds.Phone.TYPE, ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE)
+                .build())
+        }
+
+        // 4. Insert Secondary Phone
+        if (secondaryPhone.isNotBlank()) {
+            ops.add(ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+                .withValue(ContactsContract.Data.RAW_CONTACT_ID, rawContactId)
+                .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE)
+                .withValue(ContactsContract.CommonDataKinds.Phone.NUMBER, secondaryPhone)
+                .withValue(ContactsContract.CommonDataKinds.Phone.TYPE, ContactsContract.CommonDataKinds.Phone.TYPE_WORK)
+                .build())
+        }
+
+        // 5. Insert Postal Address
+        if (address.isNotBlank()) {
+            ops.add(ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+                .withValue(ContactsContract.Data.RAW_CONTACT_ID, rawContactId)
+                .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.StructuredPostal.CONTENT_ITEM_TYPE)
+                .withValue(ContactsContract.CommonDataKinds.StructuredPostal.FORMATTED_ADDRESS, address)
+                .withValue(ContactsContract.CommonDataKinds.StructuredPostal.TYPE, ContactsContract.CommonDataKinds.StructuredPostal.TYPE_WORK)
+                .build())
+        }
+
+        // 6. Insert Photo
+        if (imageBase64.isNotBlank()) {
+            try {
+                val decodedBytes = Base64.decode(imageBase64, Base64.DEFAULT)
+                ops.add(ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+                    .withValue(ContactsContract.Data.RAW_CONTACT_ID, rawContactId)
+                    .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Photo.CONTENT_ITEM_TYPE)
+                    .withValue(ContactsContract.CommonDataKinds.Photo.PHOTO, decodedBytes)
+                    .build())
+            } catch (e: Exception) {
+                Log.e(TAG, "Error adding photo inside update, base64 might be bad: ${e.message}", e)
+            }
+        }
+
+        // 7. Store Extra metadata and the #CardZap signature mark in the Note field
+        val noteContent = buildString {
+            append("$MARKER_TAG\n")
+            if (instagram.isNotBlank()) {
+                append("Instagram: $instagram\n")
+            }
+            if (useWhatsAppBusiness) {
+                append("PreferWhatsAppBusiness: true\n")
+            }
+            if (instagramFollowed) {
+                append("InstagramFollowed: true\n")
+            }
+            if (observations.isNotBlank()) {
+                append("Observations: $observations\n")
+            }
+        }
+
+        ops.add(ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+            .withValue(ContactsContract.Data.RAW_CONTACT_ID, rawContactId)
+            .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Note.CONTENT_ITEM_TYPE)
+            .withValue(ContactsContract.CommonDataKinds.Note.NOTE, noteContent)
+            .build())
+
+        return try {
+            resolver.applyBatch(ContactsContract.AUTHORITY, ops)
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to update system contact $rawContactId: ${e.message}", e)
+            false
+        }
     }
 
     // Delete a contact from Android system native contacts

@@ -12,6 +12,7 @@ import android.provider.ContactsContract
 import android.util.Base64
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -32,6 +33,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
@@ -128,6 +132,37 @@ fun MainScreen(viewModel: MainViewModel) {
         }
     }
 
+    LaunchedEffect(viewModel.isScanning) {
+        if (!viewModel.isScanning && viewModel.capturedImageBase64 != null && viewModel.scanError == null) {
+            val name = viewModel.parsedName
+            val phone = viewModel.parsedPrimaryPhone
+            val cleanPhone = phone.replace("\\D".toRegex(), "")
+            if (name.isNotBlank() || cleanPhone.isNotBlank()) {
+                val existing = contacts.find { lc ->
+                    val cleanLcPrimary = lc.primaryPhone.replace("\\D".toRegex(), "")
+                    val cleanLcSecondary = lc.secondaryPhone.replace("\\D".toRegex(), "")
+                    (cleanPhone.isNotEmpty() && (cleanLcPrimary == cleanPhone || cleanLcSecondary == cleanPhone || cleanLcPrimary.endsWith(cleanPhone) || cleanPhone.endsWith(cleanLcPrimary))) ||
+                    (name.isNotBlank() && lc.name.trim().equals(name.trim(), ignoreCase = true))
+                }
+                if (existing != null) {
+                    val merged = existing.copy(
+                        name = if (viewModel.parsedName.isNotBlank()) viewModel.parsedName else existing.name,
+                        primaryPhone = if (viewModel.parsedPrimaryPhone.isNotBlank()) viewModel.parsedPrimaryPhone else existing.primaryPhone,
+                        secondaryPhone = if (viewModel.parsedSecondaryPhone.isNotBlank()) viewModel.parsedSecondaryPhone else existing.secondaryPhone,
+                        address = if (viewModel.parsedAddress.isNotBlank()) viewModel.parsedAddress else existing.address,
+                        observations = if (viewModel.parsedObservations.isNotBlank()) viewModel.parsedObservations else existing.observations,
+                        instagram = if (viewModel.parsedInstagram.isNotBlank()) viewModel.parsedInstagram else existing.instagram,
+                        imageBase64 = viewModel.capturedImageBase64 ?: existing.imageBase64
+                    )
+                    viewModel.selectedContact = merged
+                    viewModel.editModeActive = true
+                    viewModel.clearScannedState()
+                    Toast.makeText(context, "Contato já existe (${existing.name}). Abrindo edição para evitar redundância.", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
     val tempFile = remember { File(context.cacheDir, "camera_capture.jpg") }
     val tempUri = remember {
         FileProvider.getUriForFile(
@@ -190,16 +225,27 @@ fun MainScreen(viewModel: MainViewModel) {
     Scaffold(
         topBar = {
             TopAppBar(
+                navigationIcon = {
+                    if (showCardList && viewModel.capturedImageBase64 == null) {
+                        IconButton(onClick = { showCardList = false }) {
+                            Icon(
+                                imageVector = Icons.Default.ArrowBack,
+                                contentDescription = "Voltar para tela inicial"
+                            )
+                        }
+                    }
+                },
                 title = {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.AccountBox,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(28.dp)
+                        Image(
+                            painter = androidx.compose.ui.res.painterResource(id = R.drawable.app_icon_zc_1780517771865),
+                            contentDescription = "CardZap Logo",
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(RoundedCornerShape(6.dp))
                         )
                         Text(
                             text = "CardZap",
@@ -221,20 +267,6 @@ fun MainScreen(viewModel: MainViewModel) {
                     containerColor = MaterialTheme.colorScheme.surfaceColorAtElevation(1.dp)
                 )
             )
-        },
-        floatingActionButton = {
-            if (viewModel.capturedImageBase64 == null) {
-                FloatingActionButton(
-                    onClick = { triggerCamera() },
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
-                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.CameraAlt,
-                        contentDescription = "Tirar Foto de Novo Cartão"
-                    )
-                }
-            }
         }
     ) { innerPadding ->
         Box(
@@ -286,9 +318,14 @@ fun MainScreen(viewModel: MainViewModel) {
                 if (viewModel.editModeActive) {
                     EditContactDialog(
                         contact = contact,
-                        onDismiss = { viewModel.editModeActive = false },
+                        onDismiss = { 
+                            viewModel.editModeActive = false 
+                            viewModel.selectedContact = null
+                        },
                         onSave = { updated ->
                             viewModel.saveEditedContact(updated)
+                            viewModel.editModeActive = false
+                            viewModel.selectedContact = null
                             Toast.makeText(context, "Contato atualizado com sucesso!", Toast.LENGTH_SHORT).show()
                         }
                     )
@@ -304,6 +341,9 @@ fun MainScreen(viewModel: MainViewModel) {
                             viewModel.deleteContact(contact)
                             viewModel.selectedContact = null
                             Toast.makeText(context, "Contato excluído com sucesso!", Toast.LENGTH_SHORT).show()
+                        },
+                        onUpdateContact = { updated ->
+                            viewModel.saveEditedContact(updated)
                         }
                     )
                 }
@@ -322,6 +362,34 @@ fun ScanReviewLayout(
     val scope = rememberCoroutineScope()
     val scrollState = rememberScrollState()
 
+    val contactsList by viewModel.contacts.collectAsStateWithLifecycle()
+
+    val cleanParsedPhone = remember(viewModel.parsedPrimaryPhone) {
+        viewModel.parsedPrimaryPhone.replace("\\D".toRegex(), "")
+    }
+    val existingWhatsAppContact = remember(contactsList, cleanParsedPhone) {
+        if (cleanParsedPhone.isEmpty()) null else {
+            contactsList.find { lc ->
+                val cleanLcPrimary = lc.primaryPhone.replace("\\D".toRegex(), "")
+                val cleanLcSecondary = lc.secondaryPhone.replace("\\D".toRegex(), "")
+                (cleanLcPrimary.isNotEmpty() && (cleanLcPrimary == cleanParsedPhone || cleanLcPrimary.endsWith(cleanParsedPhone) || cleanParsedPhone.endsWith(cleanLcPrimary))) ||
+                (cleanLcSecondary.isNotEmpty() && (cleanLcSecondary == cleanParsedPhone || cleanLcSecondary.endsWith(cleanParsedPhone) || cleanParsedPhone.endsWith(cleanLcSecondary)))
+            }
+        }
+    }
+
+    val cleanParsedInstagram = remember(viewModel.parsedInstagram) {
+        viewModel.parsedInstagram.replace("@", "").trim().lowercase()
+    }
+    val existingInstagramContact = remember(contactsList, cleanParsedInstagram) {
+        if (cleanParsedInstagram.isEmpty()) null else {
+            contactsList.find { lc ->
+                val cleanLcInstagram = lc.instagram.replace("@", "").trim().lowercase()
+                cleanLcInstagram == cleanParsedInstagram
+            }
+        }
+    }
+
     val isWhatsAppInstalled = remember(context) { isAppInstalled(context, "com.whatsapp") }
     val isWhatsAppBusinessInstalled = remember(context) { isAppInstalled(context, "com.whatsapp.w4b") }
 
@@ -329,10 +397,23 @@ fun ScanReviewLayout(
     val showNormal = isWhatsAppInstalled || (!isWhatsAppInstalled && !isWhatsAppBusinessInstalled)
     val showBusiness = isWhatsAppBusinessInstalled
 
-    var sendViaNormal by remember { mutableStateOf(isWhatsAppInstalled) }
-    var sendViaBusiness by remember { mutableStateOf(isWhatsAppBusinessInstalled) }
-    var followOnInstagram by remember { mutableStateOf(true) }
+    var sendViaNormal by remember { mutableStateOf(false) }
+    var sendViaBusiness by remember { mutableStateOf(false) }
+    var followOnInstagram by remember { mutableStateOf(false) }
     var customMessage by remember { mutableStateOf("") }
+
+    LaunchedEffect(existingWhatsAppContact) {
+        if (existingWhatsAppContact != null) {
+            sendViaNormal = false
+            sendViaBusiness = false
+        }
+    }
+
+    LaunchedEffect(existingInstagramContact) {
+        if (existingInstagramContact != null) {
+            followOnInstagram = false
+        }
+    }
 
     var isCheckingWhatsAppNormal by remember { mutableStateOf(false) }
     var isCheckingWhatsAppBusiness by remember { mutableStateOf(false) }
@@ -357,15 +438,30 @@ fun ScanReviewLayout(
             
             whatsAppChecked = true
             
-            // Enabled and checked by default only if guaranteed
-            sendViaNormal = whatsAppNormalExists && (isWhatsAppInstalled || (!isWhatsAppInstalled && !isWhatsAppBusinessInstalled))
-            sendViaBusiness = whatsAppBusinessExists && isWhatsAppBusinessInstalled
+            // Checkboxes remain unchecked by default per user request
+            sendViaNormal = false
+            sendViaBusiness = false
         } else {
             whatsAppNormalExists = false
             whatsAppBusinessExists = false
             whatsAppChecked = false
             sendViaNormal = false
             sendViaBusiness = false
+        }
+    }
+
+    // Force send states to false if WhatsApp connectivity does not exist
+    LaunchedEffect(whatsAppNormalExists, whatsAppBusinessExists, existingWhatsAppContact) {
+        if (existingWhatsAppContact != null) {
+            sendViaNormal = false
+            sendViaBusiness = false
+        } else {
+            if (!whatsAppNormalExists) {
+                sendViaNormal = false
+            }
+            if (!whatsAppBusinessExists) {
+                sendViaBusiness = false
+            }
         }
     }
 
@@ -377,8 +473,8 @@ fun ScanReviewLayout(
             isCheckingInstagram = false
             instagramChecked = true
             
-            // Only autofollow if the profile is verified as existing
-            followOnInstagram = instagramExists
+            // Keep default of opening Instagram to false/unchecked to enhance save speed/usability
+            followOnInstagram = false
             if (!instagramExists) {
                 Toast.makeText(context, "O contato $handle do Instagram não existe!", Toast.LENGTH_LONG).show()
             }
@@ -386,13 +482,6 @@ fun ScanReviewLayout(
             instagramExists = false
             instagramChecked = false
             followOnInstagram = false
-        }
-    }
-
-    // Ensure we start with standard option checked if on emulator where no app is detected
-    LaunchedEffect(isWhatsAppInstalled, isWhatsAppBusinessInstalled) {
-        if (!isWhatsAppInstalled && !isWhatsAppBusinessInstalled) {
-            sendViaNormal = true
         }
     }
 
@@ -496,7 +585,7 @@ fun ScanReviewLayout(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(8.dp),
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-            leadingIcon = { Icon(Icons.Default.Phone, contentDescription = null, tint = Color(0xFF25D366)) },
+            leadingIcon = { Icon(painter = androidx.compose.ui.res.painterResource(id = R.drawable.ic_whatsapp_custom), contentDescription = null, tint = Color.Unspecified, modifier = Modifier.size(24.dp)) },
             supportingText = { Text("Definido prioritariamente como o telefone associado ao WhatsApp no cartão.") }
         )
 
@@ -555,6 +644,34 @@ fun ScanReviewLayout(
                     color = MaterialTheme.colorScheme.onSurface
                 )
 
+                if (existingWhatsAppContact != null) {
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.8f)
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = "Aviso contato whatsapp existente",
+                                tint = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Text(
+                                text = "whatsapp: O ${viewModel.parsedPrimaryPhone} já existe como ${existingWhatsAppContact.name} !",
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+                }
+
                 if (isCheckingWhatsAppNormal || isCheckingWhatsAppBusiness) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -580,13 +697,13 @@ fun ScanReviewLayout(
                         Checkbox(
                             checked = sendViaNormal,
                             onCheckedChange = { sendViaNormal = it },
-                            enabled = whatsAppNormalExists
+                            enabled = whatsAppNormalExists && existingWhatsAppContact == null
                         )
                         Column {
                             Text(
                                 text = "Enviar via WhatsApp Padrão",
                                 fontSize = 13.sp,
-                                color = if (whatsAppNormalExists) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                                color = if (whatsAppNormalExists && existingWhatsAppContact == null) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
                             )
                             if (viewModel.parsedPrimaryPhone.isNotBlank() && whatsAppChecked && !whatsAppNormalExists) {
                                 Text("Apenas disponível para formato de celular celular garantido", fontSize = 10.sp, color = MaterialTheme.colorScheme.error)
@@ -603,13 +720,13 @@ fun ScanReviewLayout(
                         Checkbox(
                             checked = sendViaBusiness,
                             onCheckedChange = { sendViaBusiness = it },
-                            enabled = whatsAppBusinessExists
+                            enabled = whatsAppBusinessExists && existingWhatsAppContact == null
                         )
                         Column {
                             Text(
                                 text = "Enviar via WhatsApp Business",
                                 fontSize = 13.sp,
-                                color = if (whatsAppBusinessExists) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                                color = if (whatsAppBusinessExists && existingWhatsAppContact == null) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
                             )
                             if (viewModel.parsedPrimaryPhone.isNotBlank() && whatsAppChecked && !whatsAppBusinessExists) {
                                 Text("Apenas disponível para formato de celular garantido", fontSize = 10.sp, color = MaterialTheme.colorScheme.error)
@@ -630,7 +747,7 @@ fun ScanReviewLayout(
 
                 Spacer(modifier = Modifier.height(4.dp))
 
-                val isMessageEnabled = sendViaNormal || sendViaBusiness
+                val isMessageEnabled = (sendViaNormal || sendViaBusiness) && existingWhatsAppContact == null
 
                 Text(
                     text = "Mensagem para Enviar (Habilitado se WhatsApp selecionado):",
@@ -660,50 +777,81 @@ fun ScanReviewLayout(
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)),
             shape = RoundedCornerShape(12.dp)
         ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(14.dp),
-                verticalAlignment = Alignment.CenterVertically
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Checkbox(
-                    checked = followOnInstagram && instagramExists && instagramChecked,
-                    onCheckedChange = { followOnInstagram = it },
-                    enabled = instagramExists && !isCheckingInstagram && viewModel.parsedInstagram.isNotBlank()
-                )
-                Column(modifier = Modifier.padding(start = 8.dp)) {
-                    Text(
-                        text = "Seguir no Instagram automaticamente ao salvar",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 13.sp,
-                        color = if (instagramExists && viewModel.parsedInstagram.isNotBlank()) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
+                if (existingInstagramContact != null) {
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.8f)
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = "Aviso contato instagram existente",
+                                tint = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Text(
+                                text = "instagram: O instagram ${viewModel.parsedInstagram} já está sendo seguido !",
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Checkbox(
+                        checked = followOnInstagram,
+                        onCheckedChange = { followOnInstagram = it },
+                        enabled = instagramExists && !isCheckingInstagram && viewModel.parsedInstagram.isNotBlank() && existingInstagramContact == null
                     )
-                    if (isCheckingInstagram) {
+                    Column(modifier = Modifier.padding(start = 8.dp)) {
                         Text(
-                            text = "Verificando se o perfil existe no Instagram...",
-                            fontSize = 11.sp,
-                            color = MaterialTheme.colorScheme.primary
+                            text = "Abrir o Instagram ao salvar para seguir o contato",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            color = if (instagramExists && viewModel.parsedInstagram.isNotBlank() && existingInstagramContact == null) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
                         )
-                    } else if (viewModel.parsedInstagram.isBlank()) {
-                        Text(
-                            text = "Nenhum perfil de Instagram detectado no cartão.",
-                            fontSize = 11.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    } else if (instagramChecked && !instagramExists) {
-                        Text(
-                            text = "O contato ${viewModel.parsedInstagram} do Instagram não existe!",
-                            fontSize = 11.sp,
-                            color = MaterialTheme.colorScheme.error,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    } else if (instagramChecked && instagramExists) {
-                        Text(
-                            text = "Perfil verificado com sucesso no Instagram!",
-                            fontSize = 11.sp,
-                            color = Color(0xFF4CAF50),
-                            fontWeight = FontWeight.SemiBold
-                        )
+                        if (isCheckingInstagram) {
+                            Text(
+                                text = "Verificando se o perfil existe no Instagram...",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        } else if (viewModel.parsedInstagram.isBlank()) {
+                            Text(
+                                text = "Nenhum perfil de Instagram detectado no cartão.",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        } else if (instagramChecked && !instagramExists) {
+                            Text(
+                                text = "O contato ${viewModel.parsedInstagram} do Instagram não existe!",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.error,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        } else if (instagramChecked && instagramExists && existingInstagramContact == null) {
+                            Text(
+                                text = "Perfil verificado com sucesso no Instagram!",
+                                fontSize = 11.sp,
+                                color = Color(0xFF4CAF50),
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
                     }
                 }
             }
@@ -736,7 +884,7 @@ fun ScanReviewLayout(
                         val isBusiness = sendViaBusiness
                         val instagramHandle = viewModel.parsedInstagram
 
-                        viewModel.saveContact(isBusiness)
+                        viewModel.saveContact(isBusiness, followOnInstagram)
                         Toast.makeText(context, "Contato salvo com sucesso!", Toast.LENGTH_SHORT).show()
                         onSaved()
 
@@ -788,81 +936,254 @@ fun DashboardLayout(
 ) {
     if (!showCardList) {
         // Welcome Screen (Start Screen)
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Card(
-                modifier = Modifier.size(110.dp),
-                shape = CircleShape,
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
-            ) {
-                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Icon(
-                        imageVector = Icons.Default.AccountBox,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onSecondaryContainer,
-                        modifier = Modifier.size(54.dp)
+        Box(modifier = Modifier.fillMaxSize()) {
+            // High-fidelity active dark/royal blue gradient background
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        colors = listOf(
+                            Color(0xFF031B33), // Deep Navy
+                            Color(0xFF0D3261), // Royal Slate Blue
+                            Color(0xFF16529E)  // Active Vibrant Blue
+                        )
                     )
-                }
+                )
             }
-            Spacer(modifier = Modifier.height(24.dp))
-            Text(
-                text = "Cadastre Cartões com IA",
-                fontWeight = FontWeight.Bold,
-                fontSize = 20.sp,
-                color = MaterialTheme.colorScheme.onBackground,
-                textAlign = TextAlign.Center
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = "Alimente a IA capturando uma foto de um cartão físico para extrair seus dados automaticamente para os seus contatos corporativos e do Android!",
-                fontSize = 13.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.padding(horizontal = 24.dp)
-            )
 
-            Spacer(modifier = Modifier.height(32.dp))
-            
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(16.dp)
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(24.dp)
+                    .statusBarsPadding()
+                    .navigationBarsPadding(),
+                verticalArrangement = Arrangement.SpaceBetween,
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Button(
-                    onClick = onTakePhoto,
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(50.dp),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                // Top Header Section
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(top = 16.dp)
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.CameraAlt,
-                        contentDescription = "Tirar Foto",
-                        modifier = Modifier.size(24.dp)
+                    Text(
+                        text = "CardZap Digitalizador",
+                        fontSize = 24.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = Color.White,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Escarneie e digitalize cartões físicos com IA",
+                        fontSize = 13.5.sp,
+                        color = Color.White.copy(alpha = 0.75f),
+                        textAlign = TextAlign.Center
                     )
                 }
 
-                Button(
-                    onClick = { onShowCardListChanged(true) },
+                // 3D-oriented layered cascading physical business cards simulation area
+                Box(
                     modifier = Modifier
+                        .fillMaxWidth()
                         .weight(1f)
-                        .height(50.dp),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.secondaryContainer,
-                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer
-                    )
+                        .padding(vertical = 24.dp),
+                    contentAlignment = Alignment.Center
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Contacts,
-                        contentDescription = "Listar Cartões/Contatos",
-                        modifier = Modifier.size(24.dp)
-                    )
+                    // Card 1: Back (Carlos Lima - Carpentry & Painting)
+                    Card(
+                        modifier = Modifier
+                            .width(260.dp)
+                            .height(135.dp)
+                            .graphicsLayer(
+                                rotationZ = -12f,
+                                translationX = -30f,
+                                translationY = -25f
+                            ),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)), // Deep dark slate
+                        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.1f)),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp).fillMaxSize(),
+                            verticalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("CARLOS LIMA", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF00D215))
+                                Icon(Icons.Default.Star, contentDescription = null, tint = Color.LightGray, modifier = Modifier.size(16.dp))
+                            }
+                            Text("Reformas Residenciais e Pinturas", fontSize = 10.sp, color = Color.White.copy(alpha = 0.7f))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("(11) 98765-4321", fontSize = 9.sp, color = Color.White.copy(alpha = 0.5f))
+                                Text("São Paulo - SP", fontSize = 9.sp, color = Color.White.copy(alpha = 0.5f))
+                            }
+                        }
+                    }
+
+                    // Card 2: Middle (Clínica Vida - Dra. Beatriz)
+                    Card(
+                        modifier = Modifier
+                            .width(260.dp)
+                            .height(135.dp)
+                            .graphicsLayer(
+                                rotationZ = 8f,
+                                translationX = 25f,
+                                translationY = 5f
+                            ),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color.White),
+                        border = BorderStroke(1.dp, Color.Gray.copy(alpha = 0.15f)),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp).fillMaxSize(),
+                            verticalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("CLÍNICA VIDA", fontWeight = FontWeight.ExtraBold, fontSize = 13.sp, color = Color(0xFF0056C6))
+                                Icon(Icons.Default.Place, contentDescription = null, tint = Color(0xFFE1306C), modifier = Modifier.size(16.dp))
+                            }
+                            Text("Dra. Beatriz Sousa | Pediatra", fontSize = 10.sp, color = Color.Gray)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("(21) 2211-1313", fontSize = 9.sp, color = Color.DarkGray)
+                                Text("Rio de Janeiro - RJ", fontSize = 9.sp, color = Color.DarkGray)
+                            }
+                        }
+                    }
+
+                    // Card 3: Front / Sharp (Ana Silva - Design Studio)
+                    val scannerColor = Color(0xFF00E5FF)
+                    Card(
+                        modifier = Modifier
+                            .width(270.dp)
+                            .height(145.dp)
+                            .graphicsLayer(
+                                rotationZ = -2f,
+                                translationY = 32f
+                            ),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFC)),
+                        border = BorderStroke(1.5.dp, scannerColor), // Glowing teal scan line effect border
+                        elevation = CardDefaults.cardElevation(defaultElevation = 12.dp)
+                    ) {
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            Column(
+                                modifier = Modifier.padding(16.dp).fillMaxSize(),
+                                verticalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text("ANA SILVA", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFF0F172A))
+                                    Icon(Icons.Default.Person, contentDescription = null, tint = Color(0xFF0F172A), modifier = Modifier.size(18.dp))
+                                }
+                                Text("UX Designer & Branding", fontSize = 11.sp, color = Color(0xFF64748B))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text("contato@anasilva.design", fontSize = 10.sp, color = Color(0xFF334155))
+                                    Text("Portfólio online", fontSize = 9.sp, color = Color(0xFF64748B))
+                                }
+                            }
+
+                            // Scanner focus Corner lines to simulate scanner
+                            Canvas(modifier = Modifier.fillMaxSize()) {
+                                val w = size.width
+                                val h = size.height
+                                val lineSize = 16.dp.toPx()
+                                val strokeW = 3.dp.toPx()
+                                
+                                // Top-Left
+                                drawLine(scannerColor, Offset(0f, 0f), Offset(lineSize, 0f), strokeWidth = strokeW)
+                                drawLine(scannerColor, Offset(0f, 0f), Offset(0f, lineSize), strokeWidth = strokeW)
+                                
+                                // Top-Right
+                                drawLine(scannerColor, Offset(w, 0f), Offset(w - lineSize, 0f), strokeWidth = strokeW)
+                                drawLine(scannerColor, Offset(w, 0f), Offset(w, lineSize), strokeWidth = strokeW)
+                                
+                                // Bottom-Left
+                                drawLine(scannerColor, Offset(0f, h), Offset(lineSize, h), strokeWidth = strokeW)
+                                drawLine(scannerColor, Offset(0f, h), Offset(0f, h - lineSize), strokeWidth = strokeW)
+                                
+                                // Bottom-Right
+                                drawLine(scannerColor, Offset(w, h), Offset(w - lineSize, h), strokeWidth = strokeW)
+                                drawLine(scannerColor, Offset(w, h), Offset(w, h - lineSize), strokeWidth = strokeW)
+                            }
+                        }
+                    }
+                }
+
+                // Interactive Primary Call to Actions Section (Central Camera Trigger)
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                    modifier = Modifier.padding(bottom = 16.dp)
+                ) {
+                    // Beautiful floating central camera trigger button
+                    Button(
+                        onClick = { onTakePhoto() },
+                        modifier = Modifier
+                            .size(76.dp),
+                        shape = CircleShape,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color.White,
+                            contentColor = Color(0xFF0D3261)
+                        ),
+                        elevation = ButtonDefaults.buttonElevation(defaultElevation = 8.dp),
+                        contentPadding = PaddingValues(0.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.CameraAlt,
+                            contentDescription = "Tirar foto",
+                            modifier = Modifier.size(34.dp)
+                        )
+                    }
+
+                    // List existing local contact registry cards button
+                    ElevatedButton(
+                        onClick = { onShowCardListChanged(true) },
+                        modifier = Modifier
+                            .fillMaxWidth(0.85f)
+                            .height(52.dp),
+                        shape = RoundedCornerShape(26.dp),
+                        colors = ButtonDefaults.elevatedButtonColors(
+                            containerColor = Color.White.copy(alpha = 0.15f),
+                            contentColor = Color.White
+                        ),
+                        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.25f)),
+                        elevation = ButtonDefaults.elevatedButtonElevation(defaultElevation = 2.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Contacts,
+                            contentDescription = "Listar Cartões/Contatos",
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "Ver Meus Contatos",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp
+                        )
+                    }
                 }
             }
         }
@@ -890,20 +1211,8 @@ fun DashboardLayout(
                 }
             )
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.Start,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                OutlinedButton(
-                    onClick = { onShowCardListChanged(false) },
-                    modifier = Modifier.height(48.dp),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Icon(Icons.Default.ArrowBack, contentDescription = "Voltar")
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Início", fontSize = 14.sp)
-                }
+            BackHandler(enabled = showCardList) {
+                onShowCardListChanged(false)
             }
 
             if (contacts.isEmpty()) {
@@ -1020,10 +1329,10 @@ fun ContactCard(
                         horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Phone,
+                            painter = androidx.compose.ui.res.painterResource(id = R.drawable.ic_whatsapp_custom),
                             contentDescription = null,
-                            tint = Color(0xFF25D366),
-                            modifier = Modifier.size(12.dp)
+                            tint = Color.Unspecified,
+                            modifier = Modifier.size(14.dp)
                         )
                         Text(
                             text = contact.primaryPhone,
@@ -1325,12 +1634,39 @@ fun ContactDetailsDialog(
     getTemplateMsg: () -> String,
     onDismiss: () -> Unit,
     onEdit: () -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    onUpdateContact: (ContactEntity) -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var isCheckingInstagram by remember { mutableStateOf(false) }
     var isImageZoomed by remember { mutableStateOf(false) }
+
+    var isWhatsAppRegisteredOnNormal by remember { mutableStateOf<Boolean?>(null) }
+    var isWhatsAppRegisteredOnBusiness by remember { mutableStateOf<Boolean?>(null) }
+    var isCheckingWhatsApp by remember { mutableStateOf(false) }
+
+    var isCheckingInstagramOnLoad by remember { mutableStateOf(false) }
+    var instagramExists by remember { mutableStateOf(true) }
+
+    val isNormalInstalled = remember(context) { isAppInstalled(context, "com.whatsapp") }
+    val isBusinessInstalled = remember(context) { isAppInstalled(context, "com.whatsapp.w4b") }
+
+    LaunchedEffect(contact.primaryPhone) {
+        if (contact.primaryPhone.isNotEmpty()) {
+            isCheckingWhatsApp = true
+            isWhatsAppRegisteredOnNormal = checkIfWhatsAppRegistered(context, contact.primaryPhone, isBusiness = false)
+            isWhatsAppRegisteredOnBusiness = checkIfWhatsAppRegistered(context, contact.primaryPhone, isBusiness = true)
+            isCheckingWhatsApp = false
+        }
+    }
+
+    LaunchedEffect(contact.instagram) {
+        if (contact.instagram.isNotEmpty()) {
+            isCheckingInstagramOnLoad = true
+            instagramExists = checkIfInstagramUserExists(contact.instagram)
+            isCheckingInstagramOnLoad = false
+        }
+    }
 
     Dialog(onDismissRequest = onDismiss) {
         Card(
@@ -1358,25 +1694,21 @@ fun ContactDetailsDialog(
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary
                     )
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         IconButton(onClick = onEdit) {
                             Icon(Icons.Default.Edit, contentDescription = "Editar", tint = MaterialTheme.colorScheme.primary)
                         }
                         IconButton(onClick = onDelete) {
                             Icon(Icons.Default.Delete, contentDescription = "Excluir", tint = MaterialTheme.colorScheme.error)
                         }
-                        IconButton(
-                            onClick = onDismiss,
-                            colors = IconButtonDefaults.iconButtonColors(
-                                containerColor = MaterialTheme.colorScheme.error,
-                                contentColor = MaterialTheme.colorScheme.onError
-                            ),
-                            modifier = Modifier.size(42.dp)
-                        ) {
+                        IconButton(onClick = onDismiss) {
                             Icon(
                                 imageVector = Icons.Default.Close,
                                 contentDescription = "Fechar",
-                                modifier = Modifier.size(24.dp)
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }
@@ -1405,10 +1737,9 @@ fun ContactDetailsDialog(
                 
                 if (contact.primaryPhone.isNotEmpty()) {
                     DetailTextItem(
-                        icon = Icons.Default.Phone,
+                        painter = androidx.compose.ui.res.painterResource(id = R.drawable.ic_whatsapp_custom),
                         label = "Telefone Principal (WhatsApp):",
-                        value = contact.primaryPhone,
-                        iconColor = Color(0xFF25D366)
+                        value = contact.primaryPhone
                     )
                 }
 
@@ -1442,116 +1773,123 @@ fun ContactDetailsDialog(
                     color = MaterialTheme.colorScheme.primary
                 )
 
-                Button(
-                    onClick = {
-                        val textMsg = getTemplateMsg()
-                        openWhatsAppChat(context, contact.primaryPhone, textMsg, contact.useWhatsAppBusiness)
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF25D366))
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterHorizontally),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(Icons.Default.Share, contentDescription = null, tint = Color.White)
-                        Text("Enviar Mensagem no WhatsApp", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                    }
-                }
-
-                if (contact.instagram.isNotEmpty()) {
-                    Button(
-                        onClick = {
-                            scope.launch {
-                                isCheckingInstagram = true
-                                val exists = checkIfInstagramUserExists(contact.instagram)
-                                isCheckingInstagram = false
-                                if (exists) {
-                                    openInstagramProfile(context, contact.instagram)
-                                } else {
-                                    Toast.makeText(
-                                        context,
-                                        "O contato ${contact.instagram} do Instagram não existe!",
-                                        Toast.LENGTH_LONG
-                                    ).show()
-                                }
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE1306C)),
-                        enabled = !isCheckingInstagram
-                    ) {
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            if (isCheckingInstagram) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(18.dp),
-                                    color = Color.White,
-                                    strokeWidth = 2.dp
+                    if (contact.primaryPhone.isNotEmpty()) {
+                        if (isNormalInstalled) {
+                            Button(
+                                onClick = {
+                                    val textMsg = getTemplateMsg()
+                                    openWhatsAppChat(context, contact.primaryPhone, textMsg, false)
+                                },
+                                modifier = Modifier.size(54.dp),
+                                shape = CircleShape,
+                                colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
+                                contentPadding = PaddingValues(0.dp),
+                                enabled = !isCheckingWhatsApp
+                            ) {
+                                Icon(
+                                    painter = androidx.compose.ui.res.painterResource(id = R.drawable.ic_whatsapp_custom),
+                                    contentDescription = "WhatsApp Padrão",
+                                    tint = Color.Unspecified,
+                                    modifier = Modifier.size(54.dp)
                                 )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Verificando...", color = Color.White, fontSize = 13.sp)
-                            } else {
-                                Icon(Icons.Default.Share, contentDescription = null, tint = Color.White)
-                                Text("Seguir no Instagram", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            }
+                        }
+
+                        if (isBusinessInstalled) {
+                            Button(
+                                onClick = {
+                                    val textMsg = getTemplateMsg()
+                                    openWhatsAppChat(context, contact.primaryPhone, textMsg, true)
+                                },
+                                modifier = Modifier.size(54.dp),
+                                shape = CircleShape,
+                                colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
+                                contentPadding = PaddingValues(0.dp),
+                                enabled = !isCheckingWhatsApp
+                            ) {
+                                Icon(
+                                    painter = androidx.compose.ui.res.painterResource(id = R.drawable.ic_whatsapp_business_custom),
+                                    contentDescription = "WhatsApp Business",
+                                    tint = Color.Unspecified,
+                                    modifier = Modifier.size(54.dp)
+                                )
+                            }
+                        }
+
+                        if (!isNormalInstalled && !isBusinessInstalled) {
+                            Button(
+                                onClick = {
+                                    val textMsg = getTemplateMsg()
+                                    openWhatsAppChat(context, contact.primaryPhone, textMsg, contact.useWhatsAppBusiness)
+                                },
+                                modifier = Modifier.size(54.dp),
+                                shape = CircleShape,
+                                colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
+                                contentPadding = PaddingValues(0.dp)
+                            ) {
+                                Icon(
+                                    painter = androidx.compose.ui.res.painterResource(id = R.drawable.ic_whatsapp_custom),
+                                    contentDescription = "WhatsApp",
+                                    tint = Color.Unspecified,
+                                    modifier = Modifier.size(54.dp)
+                                )
                             }
                         }
                     }
-                }
 
-                Button(
-                    onClick = {
-                        try {
-                            val intent = Intent(Intent.ACTION_INSERT).apply {
-                                type = ContactsContract.Contacts.CONTENT_TYPE
-                                putExtra(ContactsContract.Intents.Insert.NAME, contact.name)
-                                putExtra(ContactsContract.Intents.Insert.PHONE, contact.primaryPhone)
-                                if (contact.secondaryPhone.isNotBlank()) {
-                                    putExtra(ContactsContract.Intents.Insert.SECONDARY_PHONE, contact.secondaryPhone)
+                    if (contact.instagram.isNotEmpty()) {
+                        val isInstagramButtonEnabled = !isCheckingInstagramOnLoad && instagramExists
+                        Button(
+                            onClick = {
+                                openInstagramProfile(context, contact.instagram)
+                                if (!contact.instagramFollowed) {
+                                    onUpdateContact(contact.copy(instagramFollowed = true))
                                 }
-                                if (contact.address.isNotBlank()) {
-                                    putExtra(ContactsContract.Intents.Insert.POSTAL, contact.address)
-                                }
-                                if (contact.observations.isNotBlank()) {
-                                    putExtra(ContactsContract.Intents.Insert.NOTES, contact.observations)
-                                }
-                            }
-                            context.startActivity(intent)
-                        } catch (e: Exception) {
-                            Toast.makeText(context, "Não foi possível exportar contato nativo", Toast.LENGTH_SHORT).show()
+                            },
+                            modifier = Modifier.size(54.dp),
+                            shape = CircleShape,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (instagramExists) Color(0xFFE1306C) else MaterialTheme.colorScheme.surfaceVariant,
+                                contentColor = if (instagramExists) Color.White else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                            ),
+                            contentPadding = PaddingValues(0.dp),
+                            enabled = isInstagramButtonEnabled
+                        ) {
+                            Icon(
+                                imageVector = if (!instagramExists) Icons.Default.Block else Icons.Default.Person,
+                                contentDescription = "Instagram",
+                                modifier = Modifier.size(24.dp)
+                            )
                         }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
-                ) {
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(Icons.Default.AccountBox, contentDescription = null)
-                        Text("Salvar na Agenda do Celular", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     }
                 }
 
                 HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 
-                OutlinedButton(
-                    onClick = onDismiss,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp),
-                    border = androidx.compose.foundation.BorderStroke(1.5.dp, MaterialTheme.colorScheme.outline)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                    contentAlignment = Alignment.Center
                 ) {
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.size(54.dp),
+                        shape = CircleShape,
+                        border = androidx.compose.foundation.BorderStroke(1.5.dp, MaterialTheme.colorScheme.outline),
+                        contentPadding = PaddingValues(0.dp)
                     ) {
-                        Icon(Icons.Default.Close, contentDescription = null)
-                        Text("Fechar Detalhes", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Fechar",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(24.dp)
+                        )
                     }
                 }
             }
@@ -1578,7 +1916,8 @@ fun ContactDetailsDialog(
 
 @Composable
 fun DetailTextItem(
-    icon: ImageVector,
+    icon: ImageVector? = null,
+    painter: androidx.compose.ui.graphics.painter.Painter? = null,
     label: String,
     value: String,
     iconColor: Color = MaterialTheme.colorScheme.primary
@@ -1588,14 +1927,25 @@ fun DetailTextItem(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalAlignment = Alignment.Top
     ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = null,
-            tint = iconColor,
-            modifier = Modifier
-                .size(20.dp)
-                .padding(top = 2.dp)
-        )
+        if (painter != null) {
+            Icon(
+                painter = painter,
+                contentDescription = null,
+                tint = Color.Unspecified,
+                modifier = Modifier
+                    .size(20.dp)
+                    .padding(top = 2.dp)
+            )
+        } else if (icon != null) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = iconColor,
+                modifier = Modifier
+                    .size(20.dp)
+                    .padding(top = 2.dp)
+            )
+        }
         Column {
             Text(text = label, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text(text = value, fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurface)
@@ -1616,6 +1966,22 @@ fun EditContactDialog(
     var instagram by remember { mutableStateOf(contact.instagram) }
     var address by remember { mutableStateOf(contact.address) }
     var observations by remember { mutableStateOf(contact.observations) }
+    var useWhatsAppBusiness by remember { mutableStateOf(contact.useWhatsAppBusiness) }
+    var instagramFollowed by remember { mutableStateOf(contact.instagramFollowed) }
+
+    val editContext = LocalContext.current
+    var whatsAppNormalExists by remember { mutableStateOf(false) }
+    var whatsAppBusinessExists by remember { mutableStateOf(false) }
+
+    val normalInstalled = remember(editContext) { isAppInstalled(editContext, "com.whatsapp") }
+    val businessInstalled = remember(editContext) { isAppInstalled(editContext, "com.whatsapp.w4b") }
+
+    LaunchedEffect(primaryPhone) {
+        if (primaryPhone.isNotBlank()) {
+            whatsAppNormalExists = checkIfWhatsAppRegistered(editContext, primaryPhone, isBusiness = false)
+            whatsAppBusinessExists = checkIfWhatsAppRegistered(editContext, primaryPhone, isBusiness = true)
+        }
+    }
 
     Dialog(onDismissRequest = onDismiss) {
         Card(
@@ -1655,7 +2021,7 @@ fun EditContactDialog(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(8.dp),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-                    leadingIcon = { Icon(Icons.Default.Phone, contentDescription = null, tint = Color(0xFF25D366)) }
+                    leadingIcon = { Icon(painter = androidx.compose.ui.res.painterResource(id = R.drawable.ic_whatsapp_custom), contentDescription = null, tint = Color.Unspecified, modifier = Modifier.size(24.dp)) }
                 )
 
                 OutlinedTextField(
@@ -1695,67 +2061,124 @@ fun EditContactDialog(
                     leadingIcon = { Icon(Icons.Default.Info, contentDescription = null) }
                 )
 
+                // No WhatsApp Preference checklist in Edit screen as per user request
+
+                if (instagram.isNotBlank()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = instagramFollowed,
+                            onCheckedChange = { instagramFollowed = it }
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Já sigo este contato no Instagram",
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+
                 if (primaryPhone.isNotBlank() || instagram.isNotBlank()) {
                     Text(
-                        text = "Ações para testar contato:",
+                        text = "Ações Rápidas de Integração",
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary,
                         modifier = Modifier.padding(top = 4.dp)
                     )
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterHorizontally),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
                         if (primaryPhone.isNotBlank()) {
-                            val context = LocalContext.current
-                            OutlinedButton(
-                                onClick = {
-                                    openWhatsAppChat(context, primaryPhone, "", false)
-                                },
-                                modifier = Modifier.weight(1f),
-                                shape = RoundedCornerShape(8.dp),
-                                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF25D366))
-                            ) {
-                                Row(
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                    verticalAlignment = Alignment.CenterVertically
+                            if (normalInstalled) {
+                                Button(
+                                    onClick = {
+                                        openWhatsAppChat(editContext, primaryPhone, "", false)
+                                    },
+                                    modifier = Modifier.size(54.dp),
+                                    shape = CircleShape,
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
+                                    contentPadding = PaddingValues(0.dp),
+                                    enabled = whatsAppNormalExists
                                 ) {
-                                    Icon(Icons.Default.Phone, contentDescription = null, tint = Color(0xFF25D366), modifier = Modifier.size(16.dp))
-                                    Text("WhatsApp", color = Color(0xFF25D366), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    Icon(
+                                        painter = androidx.compose.ui.res.painterResource(id = R.drawable.ic_whatsapp_custom),
+                                        contentDescription = "WhatsApp Padrão",
+                                        tint = Color.Unspecified,
+                                        modifier = Modifier.size(54.dp)
+                                    )
+                                }
+                            }
+
+                            if (businessInstalled) {
+                                Button(
+                                    onClick = {
+                                        openWhatsAppChat(editContext, primaryPhone, "", true)
+                                    },
+                                    modifier = Modifier.size(54.dp),
+                                    shape = CircleShape,
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
+                                    contentPadding = PaddingValues(0.dp),
+                                    enabled = whatsAppBusinessExists
+                                ) {
+                                    Icon(
+                                        painter = androidx.compose.ui.res.painterResource(id = R.drawable.ic_whatsapp_business_custom),
+                                        contentDescription = "WhatsApp Business",
+                                        tint = Color.Unspecified,
+                                        modifier = Modifier.size(54.dp)
+                                    )
                                 }
                             }
                         }
+
                         if (instagram.isNotBlank()) {
-                            val context = LocalContext.current
-                            OutlinedButton(
+                            Button(
                                 onClick = {
-                                    openInstagramProfile(context, instagram)
+                                    openInstagramProfile(editContext, instagram)
                                 },
-                                modifier = Modifier.weight(1f),
-                                shape = RoundedCornerShape(8.dp),
-                                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFE1306C))
+                                modifier = Modifier.size(54.dp),
+                                shape = CircleShape,
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE1306C)),
+                                contentPadding = PaddingValues(0.dp)
                             ) {
-                                Row(
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(Icons.Default.Person, contentDescription = null, tint = Color(0xFFE1306C), modifier = Modifier.size(16.dp))
-                                    Text("Instagram", color = Color(0xFFE1306C), fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                }
+                                Icon(
+                                    imageVector = if (instagramFollowed) Icons.Default.OpenInNew else Icons.Default.Person,
+                                    contentDescription = "Instagram",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(24.dp)
+                                )
                             }
                         }
                     }
                 }
 
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End,
+                    modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterHorizontally),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    TextButton(onClick = onDismiss) {
-                        Text("Cancelar")
+                    // Cancel/Close Button: Only icon, elegant circular shape
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.size(54.dp),
+                        shape = CircleShape,
+                        border = androidx.compose.foundation.BorderStroke(1.5.dp, MaterialTheme.colorScheme.outline),
+                        contentPadding = PaddingValues(0.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Cancelar",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(24.dp)
+                        )
                     }
+
+                    // Save button: Only icon, elegant circular shape
                     Button(
                         onClick = {
                             if (name.isNotBlank()) {
@@ -1766,14 +2189,24 @@ fun EditContactDialog(
                                         secondaryPhone = secondaryPhone,
                                         instagram = instagram,
                                         address = address,
-                                        observations = observations
+                                        observations = observations,
+                                        useWhatsAppBusiness = useWhatsAppBusiness,
+                                        instagramFollowed = instagramFollowed
                                     )
                                 )
                             }
                         },
-                        shape = RoundedCornerShape(8.dp)
+                        modifier = Modifier.size(54.dp),
+                        shape = CircleShape,
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                        contentPadding = PaddingValues(0.dp)
                     ) {
-                        Text("Salvar")
+                        Icon(
+                            imageVector = Icons.Default.Check,
+                            contentDescription = "Salvar",
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                            modifier = Modifier.size(24.dp)
+                        )
                     }
                 }
             }

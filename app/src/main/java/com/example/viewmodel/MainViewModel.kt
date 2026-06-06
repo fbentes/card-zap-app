@@ -177,16 +177,61 @@ class MainViewModel(
                     )
                 )
 
-                val response = RetrofitClient.apiService.generateContent(apiKey, request)
-                val responseText = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
+                val modelsToTry = listOf("gemini-3.5-flash", "gemini-2.5-flash-image")
+                var responseText: String? = null
+                var lastException: Throwable? = null
+
+                for (model in modelsToTry) {
+                    var attempt = 0
+                    val maxAttempts = 2
+                    while (attempt < maxAttempts) {
+                        try {
+                            Log.i("MainViewModel", "Iniciando tentativa $attempt de OCR usando o modelo: $model")
+                            val response = RetrofitClient.apiService.generateContent(model, apiKey, request)
+                            responseText = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
+                            if (responseText != null) {
+                                break // Success!
+                            }
+                        } catch (e: Exception) {
+                            lastException = e
+                            attempt++
+                            if (attempt < maxAttempts) {
+                                val delayMillis = attempt * 1500L
+                                Log.w("MainViewModel", "Erro na tentativa $attempt com $model: ${e.message}. Retrying em $delayMillis ms...")
+                                kotlinx.coroutines.delay(delayMillis)
+                            } else {
+                                Log.w("MainViewModel", "Falhou todas as tentativas para o modelo $model: ${e.message}")
+                            }
+                        }
+                    }
+                    if (responseText != null) {
+                        break // Success!
+                    }
+                }
 
                 if (responseText == null) {
-                    throw Exception("A resposta da IA veio vazia.")
+                    if (lastException is retrofit2.HttpException) {
+                        throw lastException
+                    } else if (lastException != null) {
+                        throw lastException
+                    } else {
+                        throw Exception("A resposta da IA veio vazia.")
+                    }
+                }
+
+                // Clean the response from markdown code fences if present (e.g. ```json ... ```)
+                var cleanJson = responseText.trim()
+                if (cleanJson.startsWith("```")) {
+                    cleanJson = cleanJson.removePrefix("```json").removePrefix("```")
+                    if (cleanJson.endsWith("```")) {
+                        cleanJson = cleanJson.removeSuffix("```")
+                    }
+                    cleanJson = cleanJson.trim()
                 }
 
                 // Parse using Moshi
                 val adapter = RetrofitClient.moshiInstance.adapter(ParsedContact::class.java)
-                val parsed = adapter.fromJson(responseText)
+                val parsed = adapter.fromJson(cleanJson)
 
                 withContext(Dispatchers.Main) {
                     if (parsed != null) {
@@ -232,89 +277,41 @@ class MainViewModel(
         }
     }
 
-    // Read directly from Contacts system or fallback to cached Room database
+    // Read directly from native Contacts system
     fun refreshContactsList() {
         viewModelScope.launch(Dispatchers.IO) {
             val context = getApplication<Application>()
             if (ContactSystemSync.hasContactsPermissions(context)) {
                 try {
-                    // 1. Try to migrate any local Room database contacts that are not yet in AndroidContacts
-                    val localContacts = repository.allContacts.first()
-                    if (localContacts.isNotEmpty()) {
-                        ContactSystemSync.migrateRoomContactsToSystem(context, localContacts)
-                    }
-                } catch (e: Exception) {
-                    Log.e("MainViewModel", "Migration from Room to system contacts failed: ${e.message}", e)
-                }
-
-                // 2. Fetch system contacts and see if they need to be populated back to Room (e.g. after reinstall)
-                try {
+                    // Fetch system contacts directly
                     val systemList = ContactSystemSync.fetchSystemContacts(context)
-                    val localContactsAfter = repository.allContacts.first()
-                    for (sc in systemList) {
-                        val existsInRoom = localContactsAfter.any { lc ->
-                            val cleanSc = sc.primaryPhone.replace("\\D".toRegex(), "")
-                            val cleanLc = lc.primaryPhone.replace("\\D".toRegex(), "")
-                            (cleanSc.isNotEmpty() && cleanSc == cleanLc) || sc.name.trim().equals(lc.name.trim(), ignoreCase = true)
-                        }
-                        if (!existsInRoom) {
-                            Log.i("MainViewModel", "Restoring system contact to Room db: ${sc.name}")
-                            repository.insertContact(sc.copy(id = 0)) // insert fresh row
-                        }
-                    }
-
-                    // Re-read local contacts after syncing system contacts to Room
-                    val updatedLocalContacts = repository.allContacts.first()
-                    // Merge lists to be absolutely sure both data sources are presented with no duplicates
-                    val merged = (systemList + updatedLocalContacts).distinctBy {
-                        val cleanP = it.primaryPhone.replace("\\D".toRegex(), "")
-                        if (cleanP.isNotEmpty()) "phone:$cleanP" else "name:${it.name.lowercase().trim()}"
-                    }
-                    _contactsList.value = merged
+                    _contactsList.value = systemList
                 } catch (e: Exception) {
-                    Log.e("MainViewModel", "Failed to query system contacts, falling back to local: ${e.message}", e)
-                    repository.allContacts.collect { roomList ->
-                        _contactsList.value = roomList
-                    }
+                    Log.e("MainViewModel", "Failed to query system contacts: ${e.message}", e)
+                    _contactsList.value = emptyList()
                 }
             } else {
-                // Permissions not granted yet. Falling back to displaying Room contents.
-                repository.allContacts.collect { roomList ->
-                    _contactsList.value = roomList
-                }
+                _contactsList.value = emptyList()
             }
         }
     }
 
-    // Save contact to modern Room database and system Contacts
-    fun saveContact(useWhatsAppBusiness: Boolean) {
+    // Save contact to native system Contacts list only
+    fun saveContact(useWhatsAppBusiness: Boolean, instagramFollowed: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
-            val entity = ContactEntity(
-                name = parsedName,
-                primaryPhone = parsedPrimaryPhone,
-                secondaryPhone = parsedSecondaryPhone,
-                address = parsedAddress,
-                observations = parsedObservations,
-                imageBase64 = capturedImageBase64 ?: "",
-                instagram = parsedInstagram,
-                useWhatsAppBusiness = useWhatsAppBusiness
-            )
-            // Insert in SQLite/Room local database
-            repository.insertContact(entity)
-            
-            // Insert into native Android system contacts
             val context = getApplication<Application>()
             if (ContactSystemSync.hasContactsPermissions(context)) {
                 ContactSystemSync.insertSystemContact(
                     context = context,
-                    name = entity.name,
-                    primaryPhone = entity.primaryPhone,
-                    secondaryPhone = entity.secondaryPhone,
-                    address = entity.address,
-                    instagram = entity.instagram,
-                    observations = entity.observations,
-                    imageBase64 = entity.imageBase64,
-                    useWhatsAppBusiness = useWhatsAppBusiness
+                    name = parsedName,
+                    primaryPhone = parsedPrimaryPhone,
+                    secondaryPhone = parsedSecondaryPhone,
+                    address = parsedAddress,
+                    instagram = parsedInstagram,
+                    observations = parsedObservations,
+                    imageBase64 = capturedImageBase64 ?: "",
+                    useWhatsAppBusiness = useWhatsAppBusiness,
+                    instagramFollowed = instagramFollowed
                 )
             }
             
@@ -328,46 +325,39 @@ class MainViewModel(
         }
     }
 
-    // Save edited Contact back to database and system contacts
+    // Save edited Contact back to system contacts
     fun saveEditedContact(contact: ContactEntity) {
         viewModelScope.launch(Dispatchers.IO) {
             val context = getApplication<Application>()
             if (ContactSystemSync.hasContactsPermissions(context)) {
-                // If it is a system contact, delete older raw contact copy
                 if (contact.id > 0) {
-                    ContactSystemSync.deleteSystemContact(context, contact.id)
+                    ContactSystemSync.updateSystemContact(
+                        context = context,
+                        rawContactId = contact.id,
+                        name = contact.name,
+                        primaryPhone = contact.primaryPhone,
+                        secondaryPhone = contact.secondaryPhone,
+                        address = contact.address,
+                        instagram = contact.instagram,
+                        observations = contact.observations,
+                        imageBase64 = contact.imageBase64,
+                        useWhatsAppBusiness = contact.useWhatsAppBusiness,
+                        instagramFollowed = contact.instagramFollowed
+                    )
+                } else {
+                    ContactSystemSync.insertSystemContact(
+                        context = context,
+                        name = contact.name,
+                        primaryPhone = contact.primaryPhone,
+                        secondaryPhone = contact.secondaryPhone,
+                        address = contact.address,
+                        instagram = contact.instagram,
+                        observations = contact.observations,
+                        imageBase64 = contact.imageBase64,
+                        useWhatsAppBusiness = contact.useWhatsAppBusiness,
+                        instagramFollowed = contact.instagramFollowed
+                    )
                 }
-                
-                // Re-insert as a fresh Raw contact with updated values
-                ContactSystemSync.insertSystemContact(
-                    context = context,
-                    name = contact.name,
-                    primaryPhone = contact.primaryPhone,
-                    secondaryPhone = contact.secondaryPhone,
-                    address = contact.address,
-                    instagram = contact.instagram,
-                    observations = contact.observations,
-                    imageBase64 = contact.imageBase64,
-                    useWhatsAppBusiness = contact.useWhatsAppBusiness
-                )
-                
-                // Also update Room Database
-                try {
-                    val localMatches = repository.allContacts.first().filter { 
-                        it.primaryPhone == contact.primaryPhone || it.name == contact.name 
-                    }
-                    if (localMatches.isNotEmpty()) {
-                        for (match in localMatches) {
-                            repository.updateContact(contact.copy(id = match.id))
-                        }
-                    } else {
-                        repository.insertContact(contact.copy(id = 0))
-                    }
-                } catch (e: Exception) {
-                    Log.e("MainViewModel", "Failed to keep Room edit in sync: ${e.message}")
-                }
-            } else {
-                repository.updateContact(contact)
             }
             
             refreshContactsList()
@@ -379,7 +369,7 @@ class MainViewModel(
         }
     }
 
-    // Delete contact from database and system contacts
+    // Delete contact from system contacts
     fun deleteContact(contact: ContactEntity) {
         viewModelScope.launch(Dispatchers.IO) {
             val context = getApplication<Application>()
@@ -387,20 +377,6 @@ class MainViewModel(
                 if (contact.id > 0) {
                     ContactSystemSync.deleteSystemContact(context, contact.id)
                 }
-                
-                // Also remove matching rows in Room so they don't get re-migrated
-                try {
-                    val localMatches = repository.allContacts.first().filter {
-                        it.primaryPhone == contact.primaryPhone || it.name == contact.name
-                    }
-                    for (match in localMatches) {
-                        repository.deleteContact(match)
-                    }
-                } catch (e: Exception) {
-                    Log.e("MainViewModel", "Failed to remove Room counterparts: ${e.message}")
-                }
-            } else {
-                repository.deleteContact(contact)
             }
             
             refreshContactsList()
